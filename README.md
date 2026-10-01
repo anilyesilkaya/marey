@@ -1,56 +1,118 @@
-# marey
+# Marey
 
-**An MCP server that lets AI agents watch your screen — as a sequence of stills.**
+**Give AI agents eyes for motion.**
 
-Named after [Étienne-Jules Marey](https://en.wikipedia.org/wiki/%C3%89tienne-Jules_Marey),
-who pioneered *chronophotography*: capturing motion as a series of still frames on a
-single plate. Marey (the server) does the same for AI agents — it records the screen
-and returns the motion as frames an agent can actually see.
+Marey is an MCP server that captures short screen recordings as a sequence of still frames and turns them into a single, agent-readable contact sheet.
 
-## Why
+It is named after [Étienne-Jules Marey](https://en.wikipedia.org/wiki/%C3%89tienne-Jules_Marey), a pioneer of **chronophotography** — the study of motion through sequences of images. Marey applies the same idea to AI agents: instead of handing a model a video it cannot reliably inspect frame by frame, it converts motion into a visual sequence the model can reason about.
 
-LLMs read still images, not video or GIFs. When you record a GIF of a bug — "the
-anchor jitters when I drag it", "the menu flashes and closes" — and hand it to an
-agent, it only receives the first frame. The motion is lost.
+---
 
-Marey closes that gap. It captures a timed sequence of screenshots and returns them
-as a **contact sheet**: one image holding a numbered, timestamped grid of every
-frame. Because it speaks the [Model Context Protocol](https://modelcontextprotocol.io),
-the agent can *request the recording itself* and receive that image inline — no
-saving files, no dragging screenshots into chat.
+## Why Marey?
 
+AI coding agents are increasingly good at understanding screenshots, but motion is still awkward.
+
+A bug such as:
+
+- an anchor jumping while it is dragged,
+- a menu flashing and immediately closing,
+- a canvas updating in the wrong order,
+- an animation stuttering between states,
+
+cannot be understood from a single screenshot.
+
+Marey bridges that gap.
+
+```text
+You interact            Marey captures               Agent sees
+
+drag / click / type  →  frame 001 · 0.00 s        →  ┌────┬────┬────┐
+                         frame 002 · 0.25 s           │ 01 │ 02 │ 03 │
+                         frame 003 · 0.50 s           ├────┼────┼────┤
+                         frame 004 · 0.75 s           │ 04 │ 05 │ 06 │
+                         ...                           └────┴────┴────┘
+                                                      contact sheet
 ```
-   agent asks           marey captures            agent receives
-  "record 5s of   ──►   frame_001  frame_002  ──►   one contact-sheet
-   the Euclid           frame_003  frame_004         image (N tiles,
-   canvas"              ...                          numbered + timed)
-```
 
-## What it exposes
+Because Marey speaks the [Model Context Protocol](https://modelcontextprotocol.io), an agent can request the recording itself and receive the resulting image directly in context.
 
-Marey is an MCP server. It offers a small set of tools to any connected agent:
+No GIF inspection. No manually extracting frames. No dragging a dozen screenshots into chat.
 
-| Tool | Purpose |
-|---|---|
-| `record` | Capture the screen for `seconds` at `fps`; return a contact-sheet image + metadata |
-| `capture` | Grab a single frame right now |
-| `list_windows` | Enumerate capturable windows (for `region: "window"`) |
+---
 
-`record` returns MCP **image content** (the contact sheet) plus a short text summary
-(frame count, dimensions, elapsed time), so the agent sees the motion directly in its
-context. Raw frames are also written to disk so you can re-stitch them differently.
+## How it works
 
-## Requirements
+1. An MCP client asks Marey to record the screen.
+2. Marey captures frames at a chosen frame rate.
+3. Each frame is numbered and timestamped.
+4. Marey composes the frames into a contact sheet.
+5. The contact sheet is returned to the agent as MCP image content.
+6. Raw frames remain available on disk for closer inspection or re-stitching.
 
-- **Node.js 18+** — the only hard requirement. The core (PNG read/write + contact-sheet
-  compositing) is pure JavaScript with **zero runtime dependencies** beyond the MCP SDK.
-- A **screen-capture backend**, auto-detected at runtime:
-  - **Windows 10/11** — built-in PowerShell + `System.Drawing` (nothing to install).
-  - **Linux (X11)** — `scrot`, ImageMagick `import`, or `ffmpeg`.
-  - **Linux (Wayland)** — `grim`.
-  - **Any OS** — `ffmpeg` on `PATH` is used when present (also enables window capture).
+The idea is deliberately simple:
 
-## Install
+**motion becomes one image containing time.**
+
+---
+
+## Tools
+
+Marey exposes three MCP tools:
+
+| Tool | What it does |
+| --- | --- |
+| `record` | Records the screen for a fixed duration and returns a timestamped contact sheet |
+| `capture` | Captures a single screenshot |
+| `list_windows` | Lists visible windows that can be targeted for capture |
+
+### `record`
+
+| Parameter | Default | Description |
+| --- | ---: | --- |
+| `seconds` | `5` | Recording duration |
+| `fps` | `2` | Frames captured per second |
+| `region` | `primary` | `primary`, `virtual`, or `window` |
+| `title` | — | Window-title substring when `region` is `window` |
+| `delay` | `0` | Delay before capture begins |
+| `cols` | `4` | Number of thumbnails per contact-sheet row |
+| `thumbWidth` | `480` | Thumbnail width in pixels |
+
+The result contains:
+
+- the contact sheet as MCP image content,
+- a short text summary with capture metadata,
+- raw frames saved locally for later inspection.
+
+### `capture`
+
+Captures one frame immediately using the same region-selection semantics as `record`.
+
+### `list_windows`
+
+Returns visible window titles, and geometry where available, so an agent can choose a target for window capture.
+
+---
+
+## Example
+
+Once Marey is connected to an MCP client, interaction can be as simple as:
+
+> Use Marey to record 6 seconds of the Euclid window at 4 fps while I drag an anchor, then tell me what changes between frames.
+
+The agent receives the complete sequence as a single image and can reason about the transition rather than only the initial state.
+
+---
+
+## Installation
+
+### Requirements
+
+- **Node.js 18+**
+- A supported screen-capture backend
+
+The image-processing core is pure JavaScript. The MCP SDK is the only npm runtime dependency; screen capture uses the native or command-line backend available on the host system.
+
+### Clone
 
 ```bash
 git clone https://github.com/anilyesilkaya/marey.git
@@ -58,15 +120,19 @@ cd marey
 npm install
 ```
 
-## Connect it to an agent
+---
 
-Add Marey to your MCP client config. For **Claude Code**:
+## Connect to an MCP client
+
+### Claude Code
 
 ```bash
 claude mcp add marey -- node /absolute/path/to/marey/src/server.mjs
 ```
 
-For **Claude Desktop** (`claude_desktop_config.json`) or any MCP client:
+### Claude Desktop or another MCP client
+
+Add Marey to the client's MCP configuration:
 
 ```json
 {
@@ -79,73 +145,73 @@ For **Claude Desktop** (`claude_desktop_config.json`) or any MCP client:
 }
 ```
 
-Once connected, just ask the agent to record:
+---
 
-> "Use marey to record 6 seconds of the Euclid window at 4fps while I drag an anchor,
-> then tell me what you see."
+## Capture backends
 
-## Tool reference
-
-### `record`
-
-| Param | Default | Meaning |
-|---|---|---|
-| `seconds` | `5` | Recording duration |
-| `fps` | `2` | Frames per second (raise for fast motion; lowers readability) |
-| `region` | `primary` | `primary` \| `virtual` (all monitors) \| `window` |
-| `title` | — | Window-title substring (required when `region` is `window`) |
-| `delay` | `0` | Count-in seconds before the first frame |
-| `cols` | `4` | Thumbnails per row in the contact sheet |
-| `thumbWidth` | `480` | Thumbnail width in px (height follows aspect ratio) |
-
-Returns: an image block (the contact sheet) + a text summary. Frames and the sheet are
-also saved under `captures/<timestamp>/`.
-
-### `capture`
-
-One frame of `region` (same `region`/`title` semantics as `record`). Returns a single
-image block.
-
-### `list_windows`
-
-Returns the titles (and geometry where available) of visible windows, so an agent can
-pick a `title` for window capture.
-
-## Output on disk
-
-```
-captures/20260101-120000/
-  frame_001_00000ms.png     raw frames (kept for re-stitching)
-  frame_002_00500ms.png
-  ...
-  contactsheet.png          the composed grid returned to the agent
-captures/latest-contactsheet.png   always mirrors the most recent sheet
-```
-
-## Platform support
+Marey auto-detects an available screen-capture backend.
 
 | Platform | Full / monitor capture | Window capture |
-|---|---|---|
-| Windows 10/11 | ✅ built-in | ✅ built-in |
-| Linux (X11) | ✅ `scrot` / `import` / `ffmpeg` | ✅ `ffmpeg` |
-| Linux (Wayland) | ✅ `grim` | ⚠️ compositor-dependent |
-| macOS / WSL | best-effort via `ffmpeg` | — |
+| --- | --- | --- |
+| Windows 10/11 | Built-in PowerShell + `System.Drawing` | Built-in |
+| Linux · X11 | `scrot`, ImageMagick `import`, or `ffmpeg` | `ffmpeg` |
+| Linux · Wayland | `grim` | Compositor-dependent |
+| macOS / WSL | Best effort via `ffmpeg` | Backend-dependent |
 
-## Design decisions
+If `ffmpeg` is available on `PATH`, Marey can use it where supported.
 
-Defaults chosen for the open questions — all are up for revision:
+---
 
-- **MCP server, not a CLI.** The whole point is that the agent requests the recording
-  and receives the result inline. (A thin CLI wrapper over the same core is an easy
-  add if you want manual recordings too.)
-- **Contact sheet is the delivered artifact.** One image conveys the full sequence;
-  raw frames are kept on disk for re-stitching at a different `cols`/`thumbWidth`
-  without re-recording.
-- **Zero-dependency core.** A pure-JS PNG codec + compositor keeps the irreplaceable
-  "frames → one image" step identical on every OS; only the OS-specific *capture*
-  shells out to a native tool. The one external dependency is the MCP SDK itself.
-- **Fixed duration + FPS**, not start/stop hotkeys — scriptable and good for short
-  interactions. An optional `delay` gives you time to focus the target.
+## Output
+
+Recordings are stored under `captures/`:
+
+```text
+captures/
+└── 20260101-120000/
+    ├── frame_001_00000ms.png
+    ├── frame_002_00500ms.png
+    ├── frame_003_01000ms.png
+    └── contactsheet.png
+
+captures/latest-contactsheet.png
+```
+
+The raw frames make it possible to generate a different contact-sheet layout without recording the interaction again.
+
+---
+
+## Design principles
+
+**Agent-first**
+
+Marey is an MCP server rather than just a screen-recording CLI. The agent can request the visual evidence it needs.
+
+**Still images over video**
+
+The output is intentionally model-friendly: a numbered, timestamped sequence of frames in one image.
+
+**Small surface area**
+
+A handful of tools cover the core workflow: record, capture, inspect.
+
+**Cross-platform core**
+
+Frame composition stays platform-independent while screen capture is delegated to the best backend available on the host.
+
+**Short, deterministic recordings**
+
+Fixed duration and frame rate make captures reproducible and easy for agents to request. An optional delay gives the user time to focus the target window before recording starts.
+
+---
+
+## Why the name?
+
+Étienne-Jules Marey used chronophotography to make motion visible by decomposing it into successive images.
+
+**Marey does the same thing for AI agents.**
+
+---
 
 ## License
 
