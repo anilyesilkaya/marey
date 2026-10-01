@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "marey",
+  "description": "Marey — give AI agents eyes for motion. An MCP screen-capture server plus a skill for temporal visual debugging.",
+  "owner": {
+    "name": "Anil Yesilkaya",
+    "url": "https://github.com/anilyesilkaya"
+  },
+  "plugins": [
+    {
+      "name": "marey",
+      "source": ".",
+      "description": "MCP screen-capture server that turns short screen recordings into agent-readable contact sheets, plus a skill that teaches Claude when and how to use them for visual debugging.",
+      "category": "developer-tools",
+      "tags": [
+        "mcp",
+        "screen-capture",
+        "visual-debugging",
+        "contact-sheet"
+      ]
+    }
+  ]
+}

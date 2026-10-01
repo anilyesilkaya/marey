@@ -308,39 +308,29 @@ Capture backends are auto-detected:
 
 Window capture on Linux requires the appropriate backend support.
 
-## Verify capture before MCP configuration
+## Verify the capture backend
 
-From the repository root:
+The server speaks MCP over stdio and has no standalone subcommands. To probe
+the capture backend outside an MCP client, clone the repo and run the bundled
+CLI:
 
 ```bash
-node src/cli.mjs backend
-node src/cli.mjs windows
+node src/cli.mjs backend             # report the detected capture backend
+node src/cli.mjs windows             # list targetable windows
 node src/cli.mjs capture --region primary
 ```
 
-Confirm that the resulting screenshot is valid.
-
-If the backend reports `*:none` or capture fails, fix the capture backend before
-debugging MCP configuration.
-
-Then test recording:
-
-```bash
-node src/cli.mjs record --seconds 3 --fps 4 --cols 4 --thumbWidth 320
-```
-
-Inspect:
-
-```text
-captures/latest-contactsheet.png
-```
+If the backend reports `*:none` or capture fails, fix the capture backend
+(install `scrot`/`grim`/`ffmpeg` on Linux; PowerShell and `screencapture` are
+built in on Windows/macOS) before debugging MCP configuration.
 
 # Connect Claude Code
 
-Use an absolute path:
+The recommended install is the published npm package via `npx` — no clone, no
+absolute path:
 
 ```bash
-claude mcp add marey -- node /absolute/path/to/marey/src/server.mjs
+claude mcp add marey -- npx -y marey
 ```
 
 Verify using:
@@ -362,16 +352,24 @@ get_frame
 list_windows
 ```
 
+Alternatively, install the Claude Code plugin, which bundles this skill and the
+MCP server together:
+
+```text
+/plugin marketplace add anilyesilkaya/marey
+/plugin install marey@marey
+```
+
 # Connect another MCP client
 
-Use an absolute path to `src/server.mjs`:
+Add Marey to the client's MCP configuration using `npx`:
 
 ```json
 {
   "mcpServers": {
     "marey": {
-      "command": "node",
-      "args": ["/absolute/path/to/marey/src/server.mjs"]
+      "command": "npx",
+      "args": ["-y", "marey"]
     }
   }
 }

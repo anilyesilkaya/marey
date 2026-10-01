@@ -3,3 +3,6 @@ captures/
 *.log
 .DS_Store
 Thumbs.db
+
+# Demo: intermediate frames are regenerable; the composed contact sheets are committed.
+demo/frames/

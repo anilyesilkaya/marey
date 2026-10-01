@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "marey",
+  "version": "0.1.0",
+  "description": "Give AI agents eyes for motion. Captures a short screen interaction as a timestamped, agent-readable contact sheet so a coding agent can see what changed — not just what the screen looks like. Zero runtime dependencies.",
+  "author": {
+    "name": "Anil Yesilkaya",
+    "url": "https://github.com/anilyesilkaya"
+  },
+  "homepage": "https://github.com/anilyesilkaya/marey",
+  "repository": "https://github.com/anilyesilkaya/marey",
+  "license": "MIT",
+  "keywords": [
+    "mcp",
+    "screen-capture",
+    "visual-debugging",
+    "contact-sheet",
+    "ai-agents",
+    "chronophotography"
+  ]
+}
