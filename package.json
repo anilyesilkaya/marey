@@ -4,7 +4,7 @@
   "description": "Give AI agents eyes for motion. An MCP server that turns a short screen interaction into a timestamped, agent-readable contact sheet — so a coding agent can see what changed, not just what the screen looks like. Zero runtime dependencies.",
   "type": "module",
   "bin": {
-    "marey": "./src/server.mjs"
+    "marey": "src/server.mjs"
   },
   "exports": {
     ".": "./src/server.mjs"
