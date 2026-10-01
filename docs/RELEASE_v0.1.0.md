@@ -10,7 +10,7 @@ a temporal sequence, with any frame retrievable at full resolution.
 ## Install
 
 ```bash
-claude mcp add marey -- npx -y marey
+claude mcp add marey -- npx -y @anilyesilkaya/marey
 ```
 
 Or install the Claude Code plugin (MCP server + skill):

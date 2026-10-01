@@ -4,15 +4,15 @@ Commands to run from a machine with **public npm** and the **`gh` CLI** signed i
 (`npm login`, `gh auth login`). This repo was prepared with everything in place;
 these are the remaining human-gated steps.
 
-## 0. Confirm the npm name is free
+## 0. npm package name
 
-```bash
-npm view marey version   # 404 = available; a version = taken, use a scope
-```
-
-If taken, switch to a scoped name: set `"name": "@anilyesilkaya/marey"` in
-`package.json`, update `packages[].identifier` in `server.json`, and the
-`npx -y marey` references to `npx -y @anilyesilkaya/marey`.
+The package is published **scoped** as `@anilyesilkaya/marey`. The unscoped
+`marey` is unregistered (a `npm view marey` returns 404) but npm's typosquat
+filter rejects it on publish as "too similar to existing packages" (`marked`,
+`vary`), so the scope is required, not optional. The scope only changes the npm
+package identifier; the MCP server name, the `claude mcp add marey` alias, the
+plugin name, and the registry name `io.github.anilyesilkaya/marey` all stay
+`marey`. Install is `npx -y @anilyesilkaya/marey`.
 
 ## 1. Repository description & topics
 
@@ -38,11 +38,22 @@ Also upload a **social preview** image (Settings → General → Social preview)
 ## 2. Publish to npm
 
 ```bash
-npm whoami            # confirm you're logged in to the PUBLIC registry
-npm publish --access public
+npm whoami --registry=https://registry.npmjs.org/   # confirm the PUBLIC registry
+npm publish --access public --registry=https://registry.npmjs.org/
 # verify
-npm view marey version
+npm view @anilyesilkaya/marey version
 ```
+
+The account enforces 2FA on publish. An interactive security key / web auth may
+not complete through a non-interactive shell; the reliable path is a **granular
+access token with "bypass 2FA" enabled**, scoped to publish:
+
+```bash
+npm config set //registry.npmjs.org/:_authToken=<GRANULAR_TOKEN>
+npm publish --access public --registry=https://registry.npmjs.org/
+```
+
+The same token becomes the `NPM_TOKEN` repo secret for the publish workflow.
 
 ## 3. Publish to the official MCP Registry
 

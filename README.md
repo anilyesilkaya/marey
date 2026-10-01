@@ -7,7 +7,7 @@ A screenshot tells an agent what the screen *looks like*. Marey tells it what *c
 Marey is a [Model Context Protocol](https://modelcontextprotocol.io) server that turns a short screen interaction into a timestamped, agent-readable **contact sheet** — a grid of still frames an agent can inspect as a temporal sequence, with any frame retrievable at full resolution.
 
 ```bash
-claude mcp add marey -- npx -y marey
+claude mcp add marey -- npx -y @anilyesilkaya/marey
 ```
 
 That's the whole install. **Zero runtime dependencies**, nothing to clone.
@@ -222,7 +222,7 @@ and no path to configure.
 ### Claude Code
 
 ```bash
-claude mcp add marey -- npx -y marey
+claude mcp add marey -- npx -y @anilyesilkaya/marey
 ```
 
 Verify with `claude mcp list` or `/mcp`.
@@ -246,7 +246,7 @@ Add Marey to the client's MCP configuration:
   "mcpServers": {
     "marey": {
       "command": "npx",
-      "args": ["-y", "marey"]
+      "args": ["-y", "@anilyesilkaya/marey"]
     }
   }
 }

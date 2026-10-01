@@ -20,7 +20,7 @@ Initial release.
 - **Capture backends:** Windows (PowerShell + `System.Drawing`), Linux X11
   (`scrot` / ImageMagick / `ffmpeg`), Linux Wayland (`grim`), macOS
   (`screencapture`).
-- **npm distribution** — installable with `npx -y marey`; zero runtime
+- **npm distribution** — installable with `npx -y @anilyesilkaya/marey`; zero runtime
   dependencies.
 - **Claude Code plugin** bundling the MCP server and the Marey skill.
 - **Official MCP Registry** manifest (`server.json`) under the name

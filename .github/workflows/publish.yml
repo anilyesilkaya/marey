@@ -5,7 +5,8 @@ name: Publish
 # npm package and its `mcpName` field during `mcp-publisher publish`.
 #
 # Required repository secret:
-#   NPM_TOKEN — an npm automation token with publish rights to `marey`.
+#   NPM_TOKEN — an npm granular token with "bypass 2FA" and publish rights to
+#   `@anilyesilkaya/marey`.
 # OIDC (id-token: write) proves ownership of the io.github.anilyesilkaya/* namespace;
 # no registry secret is needed.
 

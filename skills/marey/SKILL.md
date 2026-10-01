@@ -330,7 +330,7 @@ The recommended install is the published npm package via `npx` — no clone, no
 absolute path:
 
 ```bash
-claude mcp add marey -- npx -y marey
+claude mcp add marey -- npx -y @anilyesilkaya/marey
 ```
 
 Verify using:
@@ -369,7 +369,7 @@ Add Marey to the client's MCP configuration using `npx`:
   "mcpServers": {
     "marey": {
       "command": "npx",
-      "args": ["-y", "marey"]
+      "args": ["-y", "@anilyesilkaya/marey"]
     }
   }
 }

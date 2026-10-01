@@ -13,7 +13,7 @@
     {
       "registryType": "npm",
       "registryBaseUrl": "https://registry.npmjs.org",
-      "identifier": "marey",
+      "identifier": "@anilyesilkaya/marey",
       "version": "0.1.0",
       "runtimeHint": "npx",
       "transport": {
