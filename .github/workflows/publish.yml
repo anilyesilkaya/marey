@@ -42,8 +42,27 @@ jobs:
         run: npm test
 
       # --- npm (must come first) ---
+      # Idempotent: publish only if this exact name@version is not already on the
+      # public registry. The probe is read-only (its failure is tolerated so a
+      # brand-new package's E404 doesn't abort); `npm publish` itself runs with no
+      # error suppression, so a genuine publish failure still fails the workflow.
       - name: Publish to npm
-        run: npm publish --access public
+        run: |
+          set -euo pipefail
+          NAME="$(node -p "require('./package.json').name")"
+          VERSION="$(node -p "require('./package.json').version")"
+          echo "Checking whether $NAME@$VERSION is already on npm…"
+          # `npm view name@version version` prints the version if it exists, prints
+          # nothing if the package exists but this version does not, and exits
+          # non-zero (E404) if the package does not exist at all. All three are
+          # tolerated here because this is only a read-only existence probe.
+          PUBLISHED="$(npm view "$NAME@$VERSION" version --registry=https://registry.npmjs.org/ 2>/dev/null || true)"
+          if [ "$PUBLISHED" = "$VERSION" ]; then
+            echo "$NAME@$VERSION is already published to npm; skipping npm publish."
+          else
+            echo "$NAME@$VERSION not found on npm; publishing…"
+            npm publish --access public
+          fi
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
