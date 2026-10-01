@@ -2,41 +2,50 @@
 
 **Give AI agents eyes for motion.**
 
-Marey is an MCP server that captures short screen recordings as a sequence of still frames and turns them into a single, agent-readable contact sheet.
+A screenshot tells an agent what the screen *looks like*. Marey tells it what *changed*.
 
-It is named after [Étienne-Jules Marey](https://en.wikipedia.org/wiki/%C3%89tienne-Jules_Marey), a pioneer of **chronophotography** — the study of motion through sequences of images. Marey applies the same idea to AI agents: instead of handing a model a video it cannot reliably inspect frame by frame, it converts motion into a visual sequence the model can reason about.
+Marey is a [Model Context Protocol](https://modelcontextprotocol.io) server that turns a short screen interaction into a timestamped, agent-readable **contact sheet** — a grid of still frames an agent can inspect as a temporal sequence, with any frame retrievable at full resolution.
+
+```bash
+claude mcp add marey -- npx -y marey
+```
+
+That's the whole install. **Zero runtime dependencies**, nothing to clone.
+
+---
+
+## See it work
+
+> **You:** "The control point sometimes jumps when I drag it in the easing editor. Can you figure out what's happening?"
+>
+> **Agent:** "Let me record the interaction with Marey." *(records while you reproduce the drag)*
+
+Marey returns one image — the drag, decomposed into time:
+
+![Marey contact sheet: a control point jumping during a drag](demo/contactsheet-hero.png)
+
+> **Agent:** "The cursor moves continuously, but watch the inspector's **X** value. Through **#006 (1.25 s)** the control point tracks the cursor exactly — both read `x 331`. At **#007 (1.50 s)** a snap guide appears at the `400` gridline while the point is still tracking at `343`. One frame later, at **#008 (1.75 s)**, the point snaps to `X 400 px` while the cursor has only reached `355` — a ~45 px discontinuity. From there the cursor keeps gliding and by **#013 (3.00 s)** has *overtaken* the point (`415`), yet the point stays pinned at `400`. It isn't lagging — it's stuck to the line. Snapping is engaging too early; the snap threshold looks like it's being scaled by the 200% zoom, so it fires in canvas space instead of screen space. I'd check the snap-distance calculation."
+
+A single screenshot would show *a* point and *a* cursor — and miss the jump entirely. The sequence makes the exact failing transition obvious, and the agent reads its diagnosis straight off the frames.
+
+<sub>This is a real Marey contact sheet. Reproduce it with [`node demo/make-contactsheet.mjs`](demo/make-contactsheet.mjs), which renders the [bundled fixture](demo/jump-bug.html) and composes the frames with Marey's own contact-sheet code.</sub>
 
 ---
 
 ## Why Marey?
 
-AI coding agents are increasingly good at understanding screenshots, but motion is still awkward.
+AI coding agents are good at understanding screenshots, but motion is still awkward. A bug such as:
 
-A bug such as:
-
-- an anchor jumping while it is dragged,
+- a control point jumping while it is dragged,
 - a menu flashing and immediately closing,
 - a canvas updating in the wrong order,
 - an animation stuttering between states,
 
-cannot be understood from a single screenshot.
-
-Marey bridges that gap.
-
-```text
-You interact            Marey captures               Agent sees
-
-drag / click / type  →  frame 001 · 0.00 s        →  ┌────┬────┬────┐
-                         frame 002 · 0.25 s           │ 01 │ 02 │ 03 │
-                         frame 003 · 0.50 s           ├────┼────┼────┤
-                         frame 004 · 0.75 s           │ 04 │ 05 │ 06 │
-                         ...                           └────┴────┴────┘
-                                                      contact sheet
-```
-
-Because Marey speaks the [Model Context Protocol](https://modelcontextprotocol.io), an agent can request the recording itself and receive the resulting image directly in context.
+cannot be understood from a single screenshot. Marey bridges that gap: because it speaks MCP, the agent requests the recording itself and receives the resulting image directly in context.
 
 No GIF inspection. No manually extracting frames. No dragging a dozen screenshots into chat.
+
+It is named after [Étienne-Jules Marey](https://en.wikipedia.org/wiki/%C3%89tienne-Jules_Marey), a pioneer of **chronophotography** — the study of motion through sequences of images. Marey applies the same idea to AI agents: instead of handing a model a video it cannot reliably inspect frame by frame, it converts motion into a visual sequence the model can reason about.
 
 ---
 
@@ -203,13 +212,8 @@ frame, so the timeline is always truthful even when the target rate is not met.
 - **Screen capture** — `child_process` driving the native or command-line
   backend available on the host ([`src/capture.mjs`](src/capture.mjs)).
 
-### Clone
-
-```bash
-git clone https://github.com/anilyesilkaya/marey.git
-cd marey
-npm install
-```
+`npx` fetches and runs Marey on demand, so there is nothing to install globally
+and no path to configure.
 
 ---
 
@@ -218,7 +222,19 @@ npm install
 ### Claude Code
 
 ```bash
-claude mcp add marey -- node /absolute/path/to/marey/src/server.mjs
+claude mcp add marey -- npx -y marey
+```
+
+Verify with `claude mcp list` or `/mcp`.
+
+### Claude Code plugin
+
+The plugin bundles the MCP server **and** a skill that teaches Claude when and
+how to use Marey for visual debugging:
+
+```text
+/plugin marketplace add anilyesilkaya/marey
+/plugin install marey@marey
 ```
 
 ### Claude Desktop or another MCP client
@@ -229,11 +245,21 @@ Add Marey to the client's MCP configuration:
 {
   "mcpServers": {
     "marey": {
-      "command": "node",
-      "args": ["/absolute/path/to/marey/src/server.mjs"]
+      "command": "npx",
+      "args": ["-y", "marey"]
     }
   }
 }
+```
+
+### From source
+
+To hack on Marey, clone it and point your client at `src/server.mjs`:
+
+```bash
+git clone https://github.com/anilyesilkaya/marey.git
+cd marey
+claude mcp add marey -- node "$PWD/src/server.mjs"
 ```
 
 ---

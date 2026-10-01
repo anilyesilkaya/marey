@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "marey": {
+      "command": "npx",
+      "args": ["-y", "marey"]
+    }
+  }
+}

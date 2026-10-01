@@ -1,14 +1,20 @@
 {
   "name": "marey",
   "version": "0.1.0",
-  "description": "Give AI agents eyes for motion. An MCP server that captures short screen recordings as a sequence of still frames and composes them into a single, agent-readable contact sheet. Zero runtime dependencies.",
+  "description": "Give AI agents eyes for motion. An MCP server that turns a short screen interaction into a timestamped, agent-readable contact sheet — so a coding agent can see what changed, not just what the screen looks like. Zero runtime dependencies.",
   "type": "module",
   "bin": {
-    "marey": "src/server.mjs"
+    "marey": "./src/server.mjs"
   },
   "exports": {
     ".": "./src/server.mjs"
   },
+  "mcpName": "io.github.anilyesilkaya/marey",
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "start": "node src/server.mjs",
     "capture": "node src/cli.mjs",
@@ -20,12 +26,24 @@
   "keywords": [
     "mcp",
     "model-context-protocol",
+    "claude-code",
+    "ai-agents",
+    "coding-agents",
     "screen-capture",
-    "screenshot",
-    "chronophotography",
+    "screen-recording",
+    "visual-debugging",
     "contact-sheet",
-    "ai-agent"
+    "chronophotography"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/anilyesilkaya/marey.git"
+  },
+  "homepage": "https://github.com/anilyesilkaya/marey#readme",
+  "bugs": {
+    "url": "https://github.com/anilyesilkaya/marey/issues"
+  },
+  "author": "Anil Yesilkaya",
   "license": "MIT",
   "dependencies": {},
   "devDependencies": {}

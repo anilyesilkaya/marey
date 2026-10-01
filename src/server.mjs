@@ -4,12 +4,20 @@
 // Hand-rolled MCP (JSON-RPC 2.0 over stdio). Zero npm runtime dependencies:
 // everything below is Node builtins + this project's own modules.
 
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { StdioServer } from './jsonrpc.mjs';
 import { record, capture, getFrame, startRecording, stopRecording, recordingStatus } from './recorder.mjs';
 import { listWindows, detectBackend } from './capture.mjs';
 
+// Single source of truth for the version: package.json. Keeps the version
+// reported over MCP in sync with the published npm package automatically.
+const pkg = JSON.parse(
+  readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
+);
+
 const PROTOCOL_VERSION = '2024-11-05';
-const SERVER_INFO = { name: 'marey', version: '0.1.0' };
+const SERVER_INFO = { name: 'marey', version: pkg.version };
 
 const TOOLS = [
   {

@@ -1,0 +1,353 @@
+<!doctype html>
+<!--
+  Marey demo fixture — a miniature vector editor with a real, subtle bug.
+
+  Looks like a normal Figma/Illustrator-style editor: toolbar, Layers panel,
+  canvas with a Bézier path, Properties inspector, timeline. You drag the
+  selected (blue) control point. It tracks the cursor smoothly — until a
+  snapping bug fires too early and the point jumps to a grid line while the
+  cursor keeps moving. A snap guide appears only during the glitch.
+
+  Nothing on screen names the bug. The evidence is temporal: the cursor's x
+  readout advances smoothly while the inspector's X value jumps discontinuously.
+  A single screenshot can miss it; a Marey contact sheet makes it obvious.
+
+  The bug (see snapX): snap distance is compared in SCREEN pixels but the point
+  lives in CANVAS coordinates, so at 200% zoom snapping triggers ~2x too far
+  out. The toolbar shows "200%" without explaining why it matters.
+
+  Auto-plays one deterministic pass on a 5 s loop:
+    0.0-0.4s  idle    0.4-3.1s  smooth drag (snap fires mid-drag)    3.1-5.0s  hold
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Vector — opacity.ease</title>
+<style>
+  :root{
+    --bg:#1b1b24; --chrome:#23232e; --chrome2:#282833; --edge:#34343f;
+    --ink:#e8e8f0; --muted:#8f8fa6; --faint:#5e5e73;
+    --canvas:#15151c; --grid:#262630; --grid5:#30303d;
+    --sel:#3b82f6; --sel-ring:#60a5fa; --path:#c7c7d4; --handle:#6b6b80;
+    --guide:#f59e0b; --play:#4ade80;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:#0f0f14}
+  body{font:13px/1.4 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    color:var(--ink);display:flex;align-items:center;justify-content:center}
+  .win{width:900px;height:560px;background:var(--chrome);border:1px solid var(--edge);
+    border-radius:12px;overflow:hidden;display:flex;flex-direction:column;
+    box-shadow:0 30px 80px rgba(0,0,0,.55)}
+
+  /* toolbar */
+  .toolbar{height:46px;flex:0 0 46px;display:flex;align-items:center;gap:14px;
+    padding:0 16px;background:var(--chrome2);border-bottom:1px solid var(--edge)}
+  .brand{display:flex;align-items:center;gap:8px;font-weight:600;font-size:13px}
+  .brand .mk{color:var(--sel-ring);font-size:15px}
+  .tsep{width:1px;height:20px;background:var(--edge)}
+  .tool{width:26px;height:26px;border-radius:6px;display:flex;align-items:center;
+    justify-content:center;color:var(--muted)}
+  .tool.on{background:#34343f;color:var(--ink)}
+  .tool svg{width:15px;height:15px}
+  .spacer{flex:1}
+  .zoom{font:12px ui-monospace,Consolas,monospace;color:var(--muted);
+    padding:4px 9px;border:1px solid var(--edge);border-radius:6px}
+  .play{width:26px;height:26px;border-radius:6px;background:#2f2f3a;
+    display:flex;align-items:center;justify-content:center;color:var(--play)}
+
+  /* body: layers | canvas | inspector */
+  .main{flex:1;display:flex;min-height:0}
+  .panel{background:var(--chrome);flex:0 0 170px;border-right:1px solid var(--edge);
+    padding:14px 0}
+  .panel .ph{font-size:11px;text-transform:uppercase;letter-spacing:.7px;
+    color:var(--faint);padding:0 16px 10px}
+  .row{display:flex;align-items:center;gap:8px;padding:6px 16px;color:var(--muted);font-size:12.5px}
+  .row.child{padding-left:34px}
+  .row.sel{background:rgba(59,130,246,.16);color:var(--ink);box-shadow:inset 2px 0 0 var(--sel)}
+  .row .ic{width:13px;height:13px;color:var(--faint)}
+  .row.sel .ic{color:var(--sel-ring)}
+  .tri{width:9px;color:var(--faint)}
+
+  .stage{flex:1;position:relative;background:var(--canvas);min-width:0}
+  svg.canvas{position:absolute;inset:0;width:100%;height:100%}
+
+  .inspector{flex:0 0 190px;background:var(--chrome);border-left:1px solid var(--edge);
+    padding:16px 16px}
+  .inspector .ph{font-size:11px;text-transform:uppercase;letter-spacing:.7px;
+    color:var(--faint);margin:0 0 12px}
+  .xf{display:grid;grid-template-columns:18px 1fr;gap:10px 10px;align-items:center;margin-bottom:16px}
+  .xf .k{color:var(--muted);font:12px ui-monospace,Consolas,monospace}
+  .xf .v{font:14px/1 ui-monospace,"Cascadia Code",Consolas,monospace;color:var(--ink);
+    background:var(--bg);border:1px solid var(--edge);border-radius:6px;padding:8px 10px}
+  .divline{height:1px;background:var(--edge);margin:14px 0}
+  .opt{display:flex;align-items:center;justify-content:space-between;
+    color:var(--muted);font-size:12.5px;margin:10px 0}
+  .opt .on{color:var(--ink)}
+  .chk{color:var(--sel-ring)}
+
+  /* timeline */
+  .timeline{flex:0 0 54px;height:54px;background:var(--chrome2);
+    border-top:1px solid var(--edge);display:flex;align-items:center;padding:0 16px;gap:0}
+  .tl-times{position:relative;flex:1;height:100%;}
+  .tl-times .t{position:absolute;top:8px;font:11px ui-monospace,Consolas,monospace;
+    color:var(--faint);transform:translateX(-50%)}
+  .tl-track{position:absolute;left:0;right:0;top:32px;height:2px;background:var(--edge)}
+  .kf{position:absolute;top:28px;width:9px;height:9px;background:var(--handle);
+    border:1px solid var(--chrome2);transform:rotate(45deg) translateX(-50%)}
+  .play-head{position:absolute;top:14px;width:1.5px;height:30px;background:var(--play)}
+</style>
+</head>
+<body>
+  <div class="win">
+    <!-- toolbar -->
+    <div class="toolbar">
+      <div class="brand"><span class="mk">◆</span> Vector</div>
+      <div class="tsep"></div>
+      <div class="tool on" title="Move"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M4 2l16 7-6 2-2 6z"/></svg></div>
+      <div class="tool" title="Pen"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19l7-7-4-4-7 7-1 5z"/></svg></div>
+      <div class="tool" title="Shape"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="4" width="16" height="16" rx="2"/></svg></div>
+      <div class="spacer"></div>
+      <div class="zoom">200%</div>
+      <div class="play"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4l13 8-13 8z"/></svg></div>
+    </div>
+
+    <div class="main">
+      <!-- layers -->
+      <div class="panel">
+        <div class="ph">Layers</div>
+        <div class="row"><span class="tri">▾</span>
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 7l9-4 9 4-9 4z"/><path d="M3 7v10l9 4 9-4V7"/></svg>
+          Logo</div>
+        <div class="row child sel">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 18 C8 6 16 6 20 18"/></svg>
+          Path 1</div>
+        <div class="row child">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 12 C8 4 16 20 20 12"/></svg>
+          Path 2</div>
+        <div class="row child">
+          <svg class="ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="8"/></svg>
+          Ellipse</div>
+      </div>
+
+      <!-- canvas -->
+      <div class="stage">
+        <svg class="canvas" id="svg" viewBox="0 0 540 400" preserveAspectRatio="xMidYMid meet">
+          <g id="grid"></g>
+          <!-- snap guide (hidden until the glitch) -->
+          <line id="guide" x1="0" y1="20" x2="0" y2="380" stroke="var(--guide)"
+                stroke-width="1.5" stroke-dasharray="5 5" opacity="0"/>
+          <!-- the edited path -->
+          <path id="path" fill="none" stroke="var(--path)" stroke-width="2.5"/>
+          <!-- static anchor + its handle -->
+          <line id="h0line" stroke="var(--handle)" stroke-width="1"/>
+          <circle id="anchor0" r="4.5" fill="var(--canvas)" stroke="var(--path)" stroke-width="2"/>
+          <circle id="handle0" r="5" fill="var(--handle)"/>
+          <circle id="anchorEnd" r="4.5" fill="var(--canvas)" stroke="var(--path)" stroke-width="2"/>
+          <!-- selected control point being dragged (stays blue throughout) -->
+          <line id="selLine" stroke="var(--sel)" stroke-width="1"/>
+          <circle id="selAnchor" r="4.5" fill="var(--canvas)" stroke="var(--sel-ring)" stroke-width="2"/>
+          <circle id="point" r="7" fill="var(--sel)" stroke="var(--sel-ring)" stroke-width="2"/>
+          <!-- connector: cursor position vs. the point it drives (shows lag) -->
+          <line id="cxLine" stroke="var(--sel-ring)" stroke-width="1" stroke-dasharray="2 3" opacity="0"/>
+          <!-- pointer trail + cursor -->
+          <g id="trail"></g>
+          <g id="cursor">
+            <path d="M0 0 L0 18 L4.6 13.8 L7.4 20 L10 18.7 L7.2 12.6 L12.6 12.6 Z"
+                  fill="#fff" stroke="#15151c" stroke-width="1"/>
+            <g transform="translate(14,20)">
+              <rect x="0" y="0" width="54" height="18" rx="4" fill="rgba(21,21,28,.85)" stroke="var(--edge)"/>
+              <text id="curX" x="8" y="13" font-family="ui-monospace,Consolas,monospace"
+                    font-size="11" fill="#cfd3dc">x 000</text>
+            </g>
+          </g>
+        </svg>
+      </div>
+
+      <!-- inspector -->
+      <div class="inspector">
+        <div class="ph">Transform</div>
+        <div class="xf">
+          <div class="k">X</div><div class="v" id="ix">000 px</div>
+          <div class="k">Y</div><div class="v" id="iy">000 px</div>
+        </div>
+        <div class="divline"></div>
+        <div class="opt"><span>Snap to grid</span><span class="on chk">✓</span></div>
+        <div class="opt"><span>Grid spacing</span><span class="on">200 px</span></div>
+        <div class="opt"><span>Rotation</span><span class="on">0°</span></div>
+      </div>
+    </div>
+
+    <!-- timeline -->
+    <div class="timeline">
+      <div style="color:var(--muted);font:11px ui-monospace,Consolas,monospace;margin-right:14px">0:00</div>
+      <div class="tl-times" id="tl">
+        <div class="tl-track"></div>
+      </div>
+    </div>
+  </div>
+
+<script>
+  // ---- canvas / grid in viewBox units (540 x 400) ---------------------
+  const GRID=50;                       // grid spacing in canvas px (matches inspector)
+  const g=document.getElementById('grid');
+  for(let x=0;x<=540;x+=GRID){
+    const l=document.createElementNS('http://www.w3.org/2000/svg','line');
+    l.setAttribute('x1',x);l.setAttribute('x2',x);l.setAttribute('y1',0);l.setAttribute('y2',400);
+    l.setAttribute('stroke', x%(GRID*2)?'var(--grid)':'var(--grid5)');l.setAttribute('stroke-width','1');
+    g.appendChild(l);
+  }
+  for(let y=0;y<=400;y+=GRID){
+    const l=document.createElementNS('http://www.w3.org/2000/svg','line');
+    l.setAttribute('x1',0);l.setAttribute('x2',540);l.setAttribute('y1',y);l.setAttribute('y2',y);
+    l.setAttribute('stroke', y%(GRID*2)?'var(--grid)':'var(--grid5)');l.setAttribute('stroke-width','1');
+    g.appendChild(l);
+  }
+
+  const path=document.getElementById('path');
+  const point=document.getElementById('point'), selAnchor=document.getElementById('selAnchor'), selLine=document.getElementById('selLine');
+  const anchor0=document.getElementById('anchor0'), handle0=document.getElementById('handle0'), h0line=document.getElementById('h0line'), anchorEnd=document.getElementById('anchorEnd');
+  const guide=document.getElementById('guide');
+  const cxLine=document.getElementById('cxLine');
+  const cursor=document.getElementById('cursor'), curX=document.getElementById('curX');
+  const ix=document.getElementById('ix'), iy=document.getElementById('iy');
+  const trail=document.getElementById('trail');
+
+  // fixed geometry
+  const A0={x:120,y:300};              // start anchor
+  const H0={x:210,y:150};              // its control handle (static)
+  const AEND={x:470,y:300};            // end anchor
+  anchor0.setAttribute('cx',A0.x);anchor0.setAttribute('cy',A0.y);
+  handle0.setAttribute('cx',H0.x);handle0.setAttribute('cy',H0.y);
+  anchorEnd.setAttribute('cx',AEND.x);anchorEnd.setAttribute('cy',AEND.y);
+  h0line.setAttribute('x1',A0.x);h0line.setAttribute('y1',A0.y);
+  h0line.setAttribute('x2',H0.x);h0line.setAttribute('y2',H0.y);
+  // selected anchor sits on the end anchor; the dragged point is its handle
+  selAnchor.setAttribute('cx',AEND.x);selAnchor.setAttribute('cy',AEND.y);
+
+  // ---- the bug --------------------------------------------------------
+  // Snap distance is defined in SCREEN pixels but compared against a distance
+  // measured in CANVAS pixels, so the effective pull scales with zoom.
+  const GRIDSNAP=200;                  // snap targets the major (bold) grid lines
+  const SNAP_DISTANCE=25;              // intended: px on screen
+  const ZOOM=2.0;                      // 200%  (toolbar)
+  const SNAP_T=SNAP_DISTANCE*ZOOM;     // effective commit radius (50 canvas px)
+  const APPROACH_T=SNAP_T+8;           // the guide "arms" slightly before committing
+  function snapX(canvasX){
+    const nearest=Math.round(canvasX/GRIDSNAP)*GRIDSNAP;
+    const dist=Math.abs(canvasX-nearest);
+    // BUG: multiplies the screen-space threshold by zoom, widening the catch
+    return {x: dist<SNAP_T ? nearest : canvasX,
+            snapped: dist<SNAP_T,
+            arming: dist<APPROACH_T,   // guide shows one frame before the commit
+            line: nearest};
+  }
+
+  // ---- animation ------------------------------------------------------
+  // Frozen-frame mode: ?t=<ms> renders one deterministic timestamp (used to
+  // capture the demo headlessly, reproducibly, without recording the desktop).
+  const FROZEN = new URLSearchParams(location.search).get('t');
+  const PERIOD=5000, start=performance.now();
+  const trailPts=[];
+
+  function draw(cursorX,cursorY,showGuideAt){
+    // cubic path from A0 (with H0) to AEND, using the dragged point as end handle
+    const p=snapX(cursorX);
+    const px=p.x, py=cursorY;
+    path.setAttribute('d',`M${A0.x},${A0.y} C${H0.x},${H0.y} ${px},${py} ${AEND.x},${AEND.y}`);
+    point.setAttribute('cx',px);point.setAttribute('cy',py);
+    selLine.setAttribute('x1',AEND.x);selLine.setAttribute('y1',AEND.y);
+    selLine.setAttribute('x2',px);selLine.setAttribute('y2',py);
+
+    cursor.setAttribute('transform',`translate(${cursorX},${cursorY})`);
+    curX.textContent='x '+Math.round(cursorX);
+    ix.textContent=Math.round(px)+' px';
+    iy.textContent=Math.round(py)+' px';
+
+    // faint connector from the cursor to the point it controls — when they
+    // diverge (point pinned, cursor still moving) the lag is visible at a glance
+    const gap=Math.abs(cursorX-px);
+    if(gap>1.5){
+      cxLine.setAttribute('x1',cursorX);cxLine.setAttribute('y1',cursorY);
+      cxLine.setAttribute('x2',px);cxLine.setAttribute('y2',py);
+      cxLine.setAttribute('opacity','0.5');
+    }else{
+      cxLine.setAttribute('opacity','0');
+    }
+
+    // the snap guide arms one frame before the point actually commits
+    if(p.arming){
+      guide.setAttribute('x1',p.line);guide.setAttribute('x2',p.line);
+      guide.setAttribute('opacity','0.8');
+    }else{
+      guide.setAttribute('opacity','0');
+    }
+    return p.snapped;
+  }
+
+  // cursor position for a given phase (0..1). Pure function of time.
+  function cursorAt(phase){
+    let dragT;
+    if(phase<0.08) dragT=0;                       // idle
+    else if(phase<0.62) dragT=(phase-0.08)/0.54;  // smooth drag
+    else dragT=1;                                  // hold broken state (~0.75s)
+    // The cursor sweeps smoothly across the cell toward the major grid line at
+    // x=400, starting well clear of every snap line (290) and ending past the
+    // line (420). It tracks the point cleanly until the buggy snap commits
+    // mid-sweep: the point leaps onto 400 (~45 canvas px) while the cursor keeps
+    // gliding — the point pins to the line, the cursor overtakes it.
+    return {x:290+130*dragT, y:150+120*dragT};
+  }
+
+  // render one deterministic instant given elapsed ms since loop start
+  function render(elapsedMs){
+    const phase=(elapsedMs%PERIOD)/PERIOD;
+    const {x:cx,y:cy}=cursorAt(phase);
+
+    // reconstruct the last few cursor samples as a trail (motion cue),
+    // deterministically from the current phase so frozen frames match live.
+    trail.innerHTML='';
+    const dphase=1/60/5;               // ~one frame of the 5 s loop
+    for(let k=6;k>=1;k--){
+      const tp=cursorAt(Math.max(0,phase-k*dphase));
+      if(phase<=0.08||phase>=0.62) continue;
+      const c=document.createElementNS('http://www.w3.org/2000/svg','circle');
+      c.setAttribute('cx',tp.x);c.setAttribute('cy',tp.y);c.setAttribute('r',2.2);
+      c.setAttribute('fill','#ffffff');c.setAttribute('opacity',(6-k+1)/18);
+      trail.appendChild(c);
+    }
+    draw(cx,cy);
+  }
+
+  function frame(now){
+    render(now-start);
+    requestAnimationFrame(frame);
+  }
+
+  // timeline ticks + playhead
+  const tl=document.getElementById('tl');
+  for(let s=0;s<=4;s++){
+    const t=document.createElement('div');t.className='t';t.style.left=(s/4*100)+'%';
+    t.textContent=s+'s';tl.appendChild(t);
+    const kf=document.createElement('div');kf.className='kf';kf.style.left=(s/4*100)+'%';
+    tl.appendChild(kf);
+  }
+  const ph=document.createElement('div');ph.className='play-head';tl.appendChild(ph);
+
+  if(FROZEN!==null){
+    // deterministic single frame for headless capture
+    const ms=Number(FROZEN)||0;
+    ph.style.left=((ms%PERIOD)/PERIOD*100)+'%';
+    render(ms);
+    document.title='READY';            // signal for the capture script
+  }else{
+    function tick(now){
+      ph.style.left=(((now-start)%PERIOD)/PERIOD*100)+'%';
+      requestAnimationFrame(tick);
+    }
+    requestAnimationFrame(frame);
+    requestAnimationFrame(tick);
+  }
+</script>
+</body>
+</html>
