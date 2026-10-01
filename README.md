@@ -191,11 +191,12 @@ Marey auto-detects an available screen-capture backend.
 | Platform | Full / monitor capture | Window capture |
 | --- | --- | --- |
 | Windows 10/11 | Built-in PowerShell + `System.Drawing` | Built-in |
-| Linux · X11 | `scrot`, ImageMagick `import`, or `ffmpeg` | `ffmpeg` |
+| Linux · X11 | `scrot`, ImageMagick `import`, or `ffmpeg` | `ffmpeg` + `xdotool` |
 | Linux · Wayland | `grim` | Compositor-dependent |
-| macOS / WSL | Best effort via `ffmpeg` | Backend-dependent |
+| macOS | Built-in `screencapture` | Not yet supported |
 
-If `ffmpeg` is available on `PATH`, Marey can use it where supported.
+On Linux, window listing uses `wmctrl` or `xdotool` where available. If
+`ffmpeg` is on `PATH`, Marey can use it for X11 capture where supported.
 
 ---
 
