@@ -2,7 +2,7 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.anilyesilkaya/marey",
   "title": "Marey",
-  "description": "Give AI agents eyes for motion. An MCP server that turns a short screen interaction into a timestamped, agent-readable contact sheet — so a coding agent can see what changed, not just what the screen looks like.",
+  "description": "Give AI agents eyes for motion: see what changed on screen, not just how it looks.",
   "version": "0.1.0",
   "websiteUrl": "https://github.com/anilyesilkaya/marey",
   "repository": {
