@@ -5,7 +5,7 @@
 // everything below is Node builtins + this project's own modules.
 
 import { StdioServer } from './jsonrpc.mjs';
-import { record, capture } from './recorder.mjs';
+import { record, capture, getFrame, startRecording, stopRecording, recordingStatus } from './recorder.mjs';
 import { listWindows, detectBackend } from './capture.mjs';
 
 const PROTOCOL_VERSION = '2024-11-05';
@@ -28,12 +28,18 @@ const TOOLS = [
         region: {
           type: 'string',
           enum: ['primary', 'virtual', 'window'],
-          description: 'primary monitor, the full virtual desktop, or a window (default primary).',
+          description: 'primary monitor, the full virtual desktop, or a window (default primary). Prefer "window" when a single app is involved: a smaller source means each thumbnail keeps more detail.',
         },
         title: { type: 'string', description: 'Window-title substring to match when region is "window".' },
         delay: { type: 'number', description: 'Seconds to wait before recording starts (default 0).' },
-        cols: { type: 'number', description: 'Thumbnails per contact-sheet row (default 4).' },
-        thumbWidth: { type: 'number', description: 'Thumbnail width in pixels (default 480).' },
+        detail: {
+          type: 'string',
+          enum: ['overview', 'high', 'max'],
+          description:
+            'Legibility preset for the contact sheet (default "overview"). A returned image has a fixed resolution budget split across columns, so fewer/wider cells show more. "overview" = 4 cols @ 480px (many frames at a glance); "high" = 2 cols @ 760px (UI text usually readable); "max" = 1 col @ 1280px (closest to raw frames). Use "high"/"max" when fine detail or small text matters. Explicit cols/thumbWidth override this.',
+        },
+        cols: { type: 'number', description: 'Thumbnails per contact-sheet row. Overrides the detail preset. Fewer columns = larger, more legible cells.' },
+        thumbWidth: { type: 'number', description: 'Thumbnail width in pixels. Overrides the detail preset. Note: has little effect once the sheet exceeds the client\'s inline-image size cap — reduce cols instead.' },
       },
     },
   },
@@ -52,11 +58,59 @@ const TOOLS = [
     },
   },
   {
+    name: 'start_recording',
+    description:
+      'Begin an OPEN-ENDED recording that runs until stop_recording is called. ' +
+      'Use this (instead of record) when the USER controls the timing — e.g. ' +
+      'they will perform a drag, open a menu, or trigger an animation and you ' +
+      'cannot predict how long it takes. Start it on the user\'s cue, tell them ' +
+      'to perform the interaction, then call stop_recording. Only one recording ' +
+      'may be active at a time.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fps: { type: 'number', description: 'Frames captured per second (default 2).' },
+        region: { type: 'string', enum: ['primary', 'virtual', 'window'], description: 'Capture region (default primary).' },
+        title: { type: 'string', description: 'Window-title substring to match when region is "window".' },
+        delay: { type: 'number', description: 'Seconds to wait before capture begins (default 0).' },
+        detail: { type: 'string', enum: ['overview', 'high', 'max'], description: 'Contact-sheet legibility preset (default "overview"). See record.' },
+        cols: { type: 'number', description: 'Thumbnails per contact-sheet row. Overrides the detail preset.' },
+        thumbWidth: { type: 'number', description: 'Thumbnail width in pixels. Overrides the detail preset.' },
+      },
+    },
+  },
+  {
+    name: 'stop_recording',
+    description:
+      'Stop the recording started by start_recording and return the contact ' +
+      'sheet (plus full-resolution frame paths), exactly like record. Errors if ' +
+      'no recording is in progress.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
     name: 'list_windows',
     description:
       'List visible windows (title, process, and geometry where available) so ' +
       'a target can be chosen for window capture.',
     inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'get_frame',
+    description:
+      'Return a single frame from a prior recording at FULL RESOLUTION, as an ' +
+      'image. The contact sheet from `record` is a downscaled overview; when it ' +
+      'is too small to read fine detail or small text, call this with the ' +
+      "recording's directory and the frame number (both are listed in the " +
+      '`record` response), or with a direct frame path. This works over MCP ' +
+      'without filesystem access.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        dir: { type: 'string', description: 'Recording directory from a `record` result (its "dir" / "Frames saved under" path).' },
+        index: { type: 'number', description: '1-based frame number to fetch (e.g. 4 for frame #004). Required when using `dir`.' },
+        path: { type: 'string', description: 'Direct path to a frame PNG, as an alternative to dir + index.' },
+      },
+    },
   },
 ];
 
@@ -84,10 +138,16 @@ server.method('tools/call', async (params) => {
   switch (name) {
     case 'record':
       return handleRecord(args);
+    case 'start_recording':
+      return handleStartRecording(args);
+    case 'stop_recording':
+      return handleStopRecording();
     case 'capture':
       return handleCapture(args);
     case 'list_windows':
       return handleListWindows();
+    case 'get_frame':
+      return handleGetFrame(args);
     default:
       throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32602 });
   }
@@ -96,15 +156,45 @@ server.method('tools/call', async (params) => {
 // --- tool handlers ---------------------------------------------------------
 
 async function handleRecord(args) {
-  const result = await record(args);
+  return contactSheetResult(await record(args), 'Recorded');
+}
+
+async function handleStartRecording(args) {
+  const s = await startRecording(args);
+  const text =
+    `Recording started (${s.region}${s.title ? ` · "${s.title}"` : ''}) at ${s.fps} fps, ` +
+    `detail "${s.detail}".\nTell the user to perform the interaction now, then call ` +
+    `stop_recording to get the contact sheet.\nRecording dir: ${s.dir}`;
+  return { content: [{ type: 'text', text }] };
+}
+
+async function handleStopRecording() {
+  const result = await stopRecording();
+  const note = result.capped ? ' (stopped automatically at the frame cap)' : '';
+  return contactSheetResult(result, `Stopped recording${note}; captured`);
+}
+
+// Shared formatter for record / stop_recording: a contact-sheet image plus a
+// summary that surfaces every frame's full-resolution path, so the agent can
+// fetch the exact frame it needs via get_frame when the overview is too small.
+function contactSheetResult(result, verb) {
+  const frameList = result.frames
+    .map((f) => `  #${String(f.index).padStart(3, '0')}  ${(f.timeMs / 1000).toFixed(2)}s  ${f.path}`)
+    .join('\n');
+
   const summary =
-    `Recorded ${result.frameCount} frames over ${result.seconds}s ` +
+    `${verb} ${result.frameCount} frames over ${result.seconds.toFixed(2)}s ` +
     `at ${result.fps} fps (${result.region}` +
     `${result.title ? ` · "${result.title}"` : ''}).\n` +
-    `Elapsed: ${(result.elapsedMs / 1000).toFixed(2)}s. ` +
+    `Detail: ${result.detail} (${result.cols} cols @ ${result.thumbWidth}px). ` +
     `Contact sheet: ${result.contactSheet.width}×${result.contactSheet.height}px.\n` +
-    `Frames saved under: ${result.dir}\n` +
-    `Contact sheet: ${result.contactSheetPath}`;
+    `\nThe contact sheet below is a downscaled overview. If fine detail or small ` +
+    `text is not legible, call get_frame to fetch a specific frame at full ` +
+    `resolution (dir below + the frame number), or re-record with ` +
+    `detail:"high"/"max" or region:"window".\n` +
+    `\nRecording dir: ${result.dir}\n` +
+    `Full-resolution frames (use get_frame with this dir + the frame number):\n${frameList}\n` +
+    `\nContact sheet: ${result.contactSheetPath}`;
 
   return {
     content: [
@@ -124,6 +214,17 @@ async function handleCapture(args) {
   return {
     content: [
       imageContent(result.image.buffer),
+      { type: 'text', text: summary },
+    ],
+  };
+}
+
+async function handleGetFrame(args) {
+  const frame = await getFrame(args);
+  const summary = `Frame at full resolution: ${frame.width}×${frame.height}px.\n${frame.path}`;
+  return {
+    content: [
+      imageContent(frame.buffer),
       { type: 'text', text: summary },
     ],
   };

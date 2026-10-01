@@ -199,6 +199,134 @@ function captureBurstWindows({ region, title, frames, intervalMs }, onFrame) {
   });
 }
 
+// Open-ended streaming variant of the burst script: capture frames at
+// `intervalMs` spacing in an unbounded loop until the process is killed. Same
+// one-line "FRAME <ms> <base64>" protocol as the burst script.
+function windowsStreamScript(region, title, intervalMs) {
+  return `
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Windows.Forms
+
+function Get-TargetBounds {
+  param($region, $title)
+  if ($region -eq 'virtual') {
+    return [System.Windows.Forms.SystemInformation]::VirtualScreen
+  }
+  if ($region -eq 'window') {
+    Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public struct RECT { public int Left, Top, Right, Bottom; }
+public class Win32Stream {
+  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+}
+"@
+    $proc = Get-Process | Where-Object { $_.MainWindowTitle -like "*$title*" -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+    if ($null -eq $proc) { throw "No window matching '$title'" }
+    $rect = New-Object RECT
+    [void][Win32Stream]::GetWindowRect($proc.MainWindowHandle, [ref]$rect)
+    return New-Object System.Drawing.Rectangle($rect.Left, $rect.Top, ($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
+  }
+  return [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+}
+
+$bounds = Get-TargetBounds -region '${region}' -title '${(title || '').replace(/'/g, "''")}'
+$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+$gfx = [System.Drawing.Graphics]::FromImage($bmp)
+$stdout = [Console]::Out
+$sw = [System.Diagnostics.Stopwatch]::StartNew()
+
+$i = 0
+while ($true) {
+  $target = $i * ${intervalMs}
+  $wait = $target - $sw.Elapsed.TotalMilliseconds
+  if ($wait -gt 0) { Start-Sleep -Milliseconds ([int]$wait) }
+
+  $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+  $elapsed = [int]$sw.Elapsed.TotalMilliseconds
+  $ms = New-Object System.IO.MemoryStream
+  $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+  $stdout.WriteLine("FRAME $elapsed " + [Convert]::ToBase64String($ms.ToArray()))
+  $ms.Dispose()
+  $i++
+}
+`;
+}
+
+// Start an open-ended capture stream. Delivers each frame to onFrame({ image,
+// timeMs }, count) as it arrives. Returns a handle { stop() } where stop()
+// halts capture and resolves once no further frames will arrive.
+//
+// On Windows this runs one PowerShell process that is killed on stop; elsewhere
+// it uses a timed capture loop guarded by a stop flag.
+export function startCaptureStream({ region = 'primary', title, intervalMs = 500 } = {}, onFrame) {
+  if (process.platform === 'win32') {
+    const script = windowsStreamScript(region, title, intervalMs);
+    const child = spawn(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
+      { windowsHide: true }
+    );
+    let count = 0;
+    let buffer = '';
+    const errChunks = [];
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', (chunk) => {
+      buffer += chunk;
+      let nl;
+      while ((nl = buffer.indexOf('\n')) !== -1) {
+        const line = buffer.slice(0, nl).trim();
+        buffer = buffer.slice(nl + 1);
+        if (!line.startsWith('FRAME ')) continue;
+        const sp = line.indexOf(' ', 6);
+        const timeMs = parseInt(line.slice(6, sp), 10);
+        const image = decodePng(Buffer.from(line.slice(sp + 1), 'base64'));
+        count++;
+        if (onFrame) onFrame({ image, timeMs }, count);
+      }
+    });
+    child.stderr.on('data', (d) => errChunks.push(d));
+    const closed = new Promise((resolve) => child.on('close', () => resolve()));
+    let errored = null;
+    child.on('error', (e) => { errored = e; });
+    return {
+      stop() {
+        child.kill();
+        return closed;
+      },
+      get error() { return errored || (errChunks.length ? Buffer.concat(errChunks).toString('utf8').trim() : null); },
+    };
+  }
+
+  // Portable fallback: timed loop of single captures until stopped.
+  let stopped = false;
+  let timer = null;
+  let count = 0;
+  const start = Date.now();
+  const tick = async () => {
+    if (stopped) return;
+    try {
+      const image = await captureFrame({ region, title });
+      if (stopped) return;
+      count++;
+      if (onFrame) onFrame({ image, timeMs: Date.now() - start }, count);
+    } catch {
+      // Ignore a transient capture failure; keep the stream alive.
+    }
+    if (!stopped) timer = setTimeout(tick, intervalMs);
+  };
+  timer = setTimeout(tick, 0);
+  return {
+    stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      return Promise.resolve();
+    },
+    get error() { return null; },
+  };
+}
+
 async function listWindowsWindows() {
   const script = `
 $ErrorActionPreference = 'Stop'

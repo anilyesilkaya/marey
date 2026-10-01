@@ -57,12 +57,15 @@ The idea is deliberately simple:
 
 ## Tools
 
-Marey exposes three MCP tools:
+Marey exposes six MCP tools:
 
 | Tool | What it does |
 | --- | --- |
-| `record` | Records the screen for a fixed duration and returns a timestamped contact sheet |
+| `record` | Records the screen for a **fixed duration** and returns a timestamped contact sheet |
+| `start_recording` | Begins an **open-ended** recording the user controls |
+| `stop_recording` | Stops the open-ended recording and returns the contact sheet |
 | `capture` | Captures a single screenshot |
+| `get_frame` | Returns one frame from a recording at **full resolution** |
 | `list_windows` | Lists visible windows that can be targeted for capture |
 
 ### `record`
@@ -74,18 +77,69 @@ Marey exposes three MCP tools:
 | `region` | `primary` | `primary`, `virtual`, or `window` |
 | `title` | — | Window-title substring when `region` is `window` |
 | `delay` | `0` | Delay before capture begins |
-| `cols` | `4` | Number of thumbnails per contact-sheet row |
-| `thumbWidth` | `480` | Thumbnail width in pixels |
+| `detail` | `overview` | Legibility preset: `overview`, `high`, or `max` (see below) |
+| `cols` | `4` | Number of thumbnails per contact-sheet row (overrides `detail`) |
+| `thumbWidth` | `480` | Thumbnail width in pixels (overrides `detail`) |
 
 The result contains:
 
 - the contact sheet as MCP image content,
-- a short text summary with capture metadata,
+- a short text summary with capture metadata **and the full-resolution path of
+  every frame**, so an agent can open the exact frame it needs,
 - raw frames saved locally for later inspection.
+
+#### Resolution and the `detail` preset
+
+A single returned image has a fixed resolution budget, and a contact sheet
+splits that budget across its columns. So legibility comes from **fewer, wider
+cells** — not from `thumbWidth` alone (past a point, a large sheet is just
+downscaled again by the client). The `detail` preset picks a sensible
+columns/width pair:
+
+| `detail` | Layout | Use when |
+| --- | --- | --- |
+| `overview` (default) | 4 cols · 480px | You want many frames at a glance |
+| `high` | 2 cols · 760px | UI text / fine detail must be readable |
+| `max` | 1 col · 1280px | You need the closest thing to the raw frame |
+
+Two more levers when detail still falls short:
+
+- **Capture a `window` instead of the full screen.** A 2560px desktop shrunk
+  into a 480px thumbnail loses ~5× of its detail; an 800px window barely shrinks
+  at all.
+- **Open the raw frame.** Every frame is saved at full resolution under
+  `captures/<timestamp>/`, and the `record` response lists each one's path.
+  Reading a single raw frame is better than re-recording.
+
+### `start_recording` / `stop_recording`
+
+`record` is fixed-duration — the agent decides how long. When **you** control
+the timing (you will drag something, open a menu, trigger an animation and the
+duration is unpredictable), use the open-ended pair instead:
+
+1. The agent calls `start_recording` on your cue (same parameters as `record`
+   except `seconds`: `fps`, `region`, `title`, `delay`, `detail`, `cols`,
+   `thumbWidth`).
+2. You perform the interaction.
+3. The agent calls `stop_recording`, which composes and returns the contact
+   sheet — identical output to `record`.
+
+Only one recording may be active at a time. Frames are written to disk as they
+are captured, and a safety cap stops a forgotten session before it grows without
+bound.
 
 ### `capture`
 
 Captures one frame immediately using the same region-selection semantics as `record`.
+
+### `get_frame`
+
+Returns a single frame from a prior recording at **full resolution**, as image
+content over MCP. The contact sheet is a downscaled overview; when it is too
+small to read fine detail, call `get_frame` with the recording directory and the
+frame number (both listed in the `record` / `stop_recording` response), or a
+direct frame path. Because the frame is returned through the protocol, this works
+even for clients with no filesystem access.
 
 ### `list_windows`
 
@@ -97,9 +151,9 @@ Returns visible window titles, and geometry where available, so an agent can cho
 
 Once Marey is connected to an MCP client, interaction can be as simple as:
 
-> Use Marey to record 6 seconds of the Euclid window at 4 fps while I drag an anchor, then tell me what changes between frames.
+> Use Marey to record 6 seconds of my editor window at 4 fps with high detail while I drag an element, then tell me what changes between frames.
 
-The agent receives the complete sequence as a single image and can reason about the transition rather than only the initial state.
+The agent receives the complete sequence as a single image and can reason about the transition rather than only the initial state. If any frame needs a closer look, the full-resolution originals are listed in the response and saved under `captures/`.
 
 ---
 
@@ -112,8 +166,8 @@ before wiring up an MCP client:
 node src/cli.mjs backend                 # report the detected capture backend
 node src/cli.mjs windows                 # list targetable windows
 node src/cli.mjs capture --region primary
-node src/cli.mjs record --seconds 4 --fps 4 --cols 4 --thumbWidth 320
-node src/cli.mjs record --region window --title "Euclid" --seconds 6 --fps 4
+node src/cli.mjs record --seconds 4 --fps 4 --detail high
+node src/cli.mjs record --region window --title "Visual Studio Code" --seconds 6 --fps 4 --detail max
 ```
 
 ### A note on frame rate

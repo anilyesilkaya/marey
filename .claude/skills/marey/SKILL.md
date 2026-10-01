@@ -78,13 +78,16 @@ shown on each frame because FPS is only a target.
 
 Start with the smallest recording likely to reveal the behavior.
 
+Choose `detail` by what must be read, not by habit. If the behavior involves UI
+text, labels, or fine detail, start at `detail: "high"`; the default
+`"overview"` packs the whole screen into small cells and is often unreadable.
+
 ### Normal UI interaction
 
 ```text
 seconds: 4
 fps: 3
-cols: 4
-thumbWidth: 480
+detail: "high"
 ```
 
 ### Slow animation or transition
@@ -92,6 +95,7 @@ thumbWidth: 480
 ```text
 seconds: 6
 fps: 2
+detail: "high"
 ```
 
 ### Short or fast visual event
@@ -99,6 +103,12 @@ fps: 2
 ```text
 seconds: 2
 fps: 6
+```
+
+### Many frames at a glance (coarse motion, no fine detail)
+
+```text
+detail: "overview"
 ```
 
 Higher requested FPS does not guarantee higher effective FPS. Screen capture and
@@ -111,8 +121,21 @@ If frames are being missed:
 3. Shorten the recording.
 4. Increase `fps` only when the event genuinely requires it.
 
-If the contact sheet is difficult to inspect, increase `thumbWidth` or reduce
-`cols`.
+If the contact sheet is difficult to read, raise the `detail` preset before
+anything else:
+
+```text
+detail: "overview"   # default: 4 cols @ 480px, many frames at a glance
+detail: "high"       # 2 cols @ 760px, UI text usually readable
+detail: "max"        # 1 col @ 1280px, closest to the raw frame
+```
+
+A returned image has a fixed resolution budget split across columns, so
+legibility comes from fewer, wider cells — not from `thumbWidth` alone. `detail`
+sets both at once; explicit `cols`/`thumbWidth` still override it.
+
+When even `detail: "max"` is not enough, read the full-resolution raw frame
+directly (see **Interpreting a recording**) instead of re-recording.
 
 # Targeting a window
 
@@ -146,18 +169,35 @@ Prefer window capture because it:
 
 # Coordinating an interaction
 
-If the behavior must be triggered manually, use `delay`.
+When the behavior must be triggered manually, choose between two timing models:
 
-Example:
+## Fixed duration (`record` + `delay`)
+
+Use when the interaction is short and its duration is predictable. Set `delay`
+so the user can get ready, tell them exactly when to act, and `record` captures
+for a fixed `seconds`.
 
 ```text
-delay: 3
+record { seconds: 5, fps: 4, delay: 3, detail: "high" }
 ```
 
-Tell the user what action should be performed during the recording and keep the
-interaction simple enough to reproduce reliably.
-
 Do not use long delays when they are unnecessary.
+
+## Open-ended (`start_recording` / `stop_recording`)
+
+Use when the **user** controls the timing and the duration is unpredictable
+(dragging until something happens, waiting for a load, exploring a menu).
+
+1. Call `start_recording` (same options as `record` except `seconds`).
+2. Tell the user to perform the interaction now.
+3. When the user says they are done, call `stop_recording`. It returns a contact
+   sheet exactly like `record`.
+
+Only one recording can be active at a time. If `start_recording` reports one
+already in progress, call `stop_recording` first. Prefer this pair over a long
+fixed `record` when you would otherwise be guessing the duration.
+
+Keep the interaction simple enough to reproduce reliably.
 
 # Interpreting a recording
 
@@ -181,23 +221,32 @@ fully visible by #005 (1.51 s).
 
 Avoid unsupported timing claims based only on the requested FPS.
 
-If the contact sheet does not contain enough detail, inspect the relevant raw
-full-resolution frames under:
+If the contact sheet does not contain enough detail, fetch the relevant frames
+at full resolution with `get_frame` instead of re-recording. Pass the recording
+directory and the frame number (both are listed in the `record` /
+`stop_recording` response):
 
 ```text
-captures/<timestamp>/
+get_frame { dir: "<recording dir from the response>", index: 4 }
 ```
+
+`get_frame` returns the original full-resolution frame as an image over MCP, so
+it works even without filesystem access. The raw frames are also on disk under
+`captures/<timestamp>/` for clients that prefer to read them directly.
 
 Do this before re-recording unless the event itself was missed.
 
 # Available MCP tools
 
-Marey exposes three tools.
+Marey exposes six tools.
 
 | Tool | Use |
 | --- | --- |
-| `record` | Capture temporal behavior and return a contact sheet |
+| `record` | Capture temporal behavior for a fixed duration and return a contact sheet |
+| `start_recording` | Begin an open-ended recording the user controls |
+| `stop_recording` | Stop the open-ended recording and return the contact sheet |
 | `capture` | Capture one screenshot |
+| `get_frame` | Fetch one frame from a recording at full resolution |
 | `list_windows` | Discover windows that can be targeted |
 
 ## `record`
@@ -211,8 +260,31 @@ Parameters:
 | `region` | `primary` | `primary`, `virtual`, or `window` |
 | `title` | — | Window-title substring required for `window` |
 | `delay` | `0` | Delay before recording starts |
-| `cols` | `4` | Contact-sheet columns |
-| `thumbWidth` | `480` | Thumbnail width in pixels |
+| `detail` | `overview` | Legibility preset: `overview`, `high`, or `max` |
+| `cols` | `4` | Contact-sheet columns (overrides `detail`) |
+| `thumbWidth` | `480` | Thumbnail width in pixels (overrides `detail`) |
+
+## `start_recording`
+
+Takes the same parameters as `record` **except `seconds`** (the recording runs
+until `stop_recording`): `fps`, `region`, `title`, `delay`, `detail`, `cols`,
+`thumbWidth`. Only one recording can be active at a time.
+
+## `stop_recording`
+
+Takes no arguments. Stops the active recording and returns a contact sheet with
+the same shape as `record`.
+
+## `get_frame`
+
+Returns one frame at full resolution. Supply either the recording directory plus
+a frame number, or a direct frame path.
+
+| Parameter | Default | Meaning |
+| --- | ---: | --- |
+| `dir` | — | Recording directory from a `record` / `stop_recording` response |
+| `index` | — | 1-based frame number (required with `dir`) |
+| `path` | — | Direct path to a frame PNG (alternative to `dir` + `index`) |
 
 `capture` supports `region`, `title`, and `delay`.
 
@@ -283,7 +355,10 @@ The following tools should be available:
 
 ```text
 record
+start_recording
+stop_recording
 capture
+get_frame
 list_windows
 ```
 
@@ -362,6 +437,9 @@ The response should identify the server as `marey` and list:
 
 ```text
 record
+start_recording
+stop_recording
 capture
+get_frame
 list_windows
 ```

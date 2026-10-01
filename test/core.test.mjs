@@ -5,10 +5,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
+import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import os from 'node:os';
+import path from 'node:path';
+
 import { encodePng, decodePng } from '../src/png.mjs';
 import { createImage, resize, blit, fillRect, drawText } from '../src/image.mjs';
 import { measureText } from '../src/font.mjs';
 import { composeContactSheet } from '../src/contactsheet.mjs';
+import { getFrame } from '../src/recorder.mjs';
 
 function makeGradient(w, h) {
   const img = createImage(w, h);
@@ -116,4 +121,47 @@ test('composeContactSheet lays out a grid with captions', () => {
 
 test('composeContactSheet rejects an empty frame list', () => {
   assert.throws(() => composeContactSheet([], {}), /zero frames/);
+});
+
+test('getFrame returns full-resolution bytes by dir + index and by path', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'marey-test-'));
+  try {
+    // Lay out a recording-like directory with two distinct frames.
+    const f1 = makeGradient(120, 80);
+    const f2 = makeGradient(64, 48);
+    const p1 = path.join(dir, 'frame_001_00000ms.png');
+    const p2 = path.join(dir, 'frame_002_00500ms.png');
+    await writeFile(p1, encodePng(f1.width, f1.height, f1.data));
+    await writeFile(p2, encodePng(f2.width, f2.height, f2.data));
+
+    // By dir + index: dimensions match the on-disk frame, not a thumbnail.
+    const byIndex = await getFrame({ dir, index: 2 });
+    assert.equal(byIndex.width, 64);
+    assert.equal(byIndex.height, 48);
+    assert.equal(byIndex.path, p2);
+    // Returned bytes decode back to the original pixels.
+    assert.ok(decodePng(byIndex.buffer).data.equals(f2.data));
+
+    // By direct path.
+    const byPath = await getFrame({ path: p1 });
+    assert.equal(byPath.width, 120);
+    assert.equal(byPath.height, 80);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('getFrame reports a helpful error for a missing frame index', async () => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'marey-test-'));
+  try {
+    const f = makeGradient(32, 32);
+    await writeFile(path.join(dir, 'frame_001_00000ms.png'), encodePng(f.width, f.height, f.data));
+    await assert.rejects(() => getFrame({ dir, index: 9 }), /No frame #9.*1 frames/s);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('getFrame requires dir+index or path', async () => {
+  await assert.rejects(() => getFrame({}), /requires either .path., or .dir./);
 });
