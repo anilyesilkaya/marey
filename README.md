@@ -103,6 +103,32 @@ The agent receives the complete sequence as a single image and can reason about 
 
 ---
 
+## Command-line use
+
+Marey also runs standalone, which is handy for verifying your capture backend
+before wiring up an MCP client:
+
+```bash
+node src/cli.mjs backend                 # report the detected capture backend
+node src/cli.mjs windows                 # list targetable windows
+node src/cli.mjs capture --region primary
+node src/cli.mjs record --seconds 4 --fps 4 --cols 4 --thumbWidth 320
+node src/cli.mjs record --region window --title "Euclid" --seconds 6 --fps 4
+```
+
+### A note on frame rate
+
+`fps` is the **target** rate. The achievable rate is bounded by how fast the
+host can grab and encode a frame — on a 2560×1440 primary monitor, a full-screen
+grab plus PNG save costs a few hundred milliseconds, so the practical ceiling is
+roughly 2–3 fps at full resolution. Capturing a smaller `region` (or a single
+`window`) is faster. On Windows, an entire recording runs inside **one**
+PowerShell process rather than one per frame, so capture is not throttled by
+process-startup overhead. Frame labels show the *actual* elapsed time of each
+frame, so the timeline is always truthful even when the target rate is not met.
+
+---
+
 ## Installation
 
 ### Requirements
@@ -110,7 +136,18 @@ The agent receives the complete sequence as a single image and can reason about 
 - **Node.js 18+**
 - A supported screen-capture backend
 
-The image-processing core is pure JavaScript. The MCP SDK is the only npm runtime dependency; screen capture uses the native or command-line backend available on the host system.
+**Zero runtime dependencies.** Marey ships with an empty `dependencies` block —
+`npm install` pulls nothing. Everything is built on Node builtins:
+
+- **PNG decode/encode** — pure JavaScript over the builtin `zlib`
+  ([`src/png.mjs`](src/png.mjs)); no `sharp`, `jimp`, or `pngjs`.
+- **Thumbnails, compositing, and frame labels** — a pure-JS image buffer and a
+  hand-coded 5×7 bitmap font ([`src/image.mjs`](src/image.mjs),
+  [`src/font.mjs`](src/font.mjs)); no image or font library.
+- **MCP protocol** — JSON-RPC 2.0 over stdio, hand-rolled
+  ([`src/jsonrpc.mjs`](src/jsonrpc.mjs)); no MCP SDK.
+- **Screen capture** — `child_process` driving the native or command-line
+  backend available on the host ([`src/capture.mjs`](src/capture.mjs)).
 
 ### Clone
 
@@ -198,6 +235,13 @@ A handful of tools cover the core workflow: record, capture, inspect.
 **Cross-platform core**
 
 Frame composition stays platform-independent while screen capture is delegated to the best backend available on the host.
+
+**Zero dependencies**
+
+The entire pipeline — PNG codec, image compositing, frame labelling, and the
+MCP protocol itself — is built on Node builtins. Nothing is pulled from npm, so
+there is no supply chain to audit, no install step beyond cloning, and no
+version drift in third-party packages.
 
 **Short, deterministic recordings**
 

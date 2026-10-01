@@ -1,0 +1,32 @@
+{
+  "name": "marey",
+  "version": "0.1.0",
+  "description": "Give AI agents eyes for motion. An MCP server that captures short screen recordings as a sequence of still frames and composes them into a single, agent-readable contact sheet. Zero runtime dependencies.",
+  "type": "module",
+  "bin": {
+    "marey": "src/server.mjs"
+  },
+  "exports": {
+    ".": "./src/server.mjs"
+  },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "capture": "node src/cli.mjs",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "screen-capture",
+    "screenshot",
+    "chronophotography",
+    "contact-sheet",
+    "ai-agent"
+  ],
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}
