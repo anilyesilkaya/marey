@@ -72,6 +72,21 @@ function unfilter(data, width, height, bpp) {
   return out;
 }
 
+// --- dimensions (cheap) -----------------------------------------------------
+
+// Read just width/height from the IHDR without decoding pixels. IHDR is always
+// the first chunk, so width/height live at fixed offsets 16 and 20. Lets the
+// recorder record frame geometry without paying a full decode per frame.
+export function pngDimensions(buffer) {
+  if (buffer.length < 24 || !buffer.subarray(0, 8).equals(PNG_SIGNATURE)) {
+    throw new Error('Not a PNG (bad signature)');
+  }
+  if (buffer.toString('ascii', 12, 16) !== 'IHDR') {
+    throw new Error('Malformed PNG (IHDR is not the first chunk)');
+  }
+  return { width: buffer.readUInt32BE(16), height: buffer.readUInt32BE(20) };
+}
+
 // --- decode ----------------------------------------------------------------
 
 // Returns { width, height, data } where data is RGBA (4 bytes/pixel).

@@ -9,6 +9,7 @@ import { fileURLToPath } from 'node:url';
 import { StdioServer } from './jsonrpc.mjs';
 import { record, capture, getFrame, startRecording, stopRecording, recordingStatus } from './recorder.mjs';
 import { listWindows, detectBackend } from './capture.mjs';
+import { TargetUnavailableError } from './capture.mjs';
 
 // Single source of truth for the version: package.json. Keeps the version
 // reported over MCP in sync with the published npm package automatically.
@@ -120,6 +121,15 @@ const TOOLS = [
       },
     },
   },
+  {
+    name: 'status',
+    description:
+      'Report whether an open-ended recording (from start_recording) is ' +
+      'currently active, and if so its directory, frame count so far, region, ' +
+      'and frame rate. Use this to check state before start_recording or ' +
+      'stop_recording.',
+    inputSchema: { type: 'object', properties: {} },
+  },
 ];
 
 const server = new StdioServer();
@@ -142,22 +152,48 @@ server.method('ping', async () => ({}));
 server.method('tools/list', async () => ({ tools: TOOLS }));
 
 server.method('tools/call', async (params) => {
-  const { name, arguments: args = {} } = params;
-  switch (name) {
-    case 'record':
-      return handleRecord(args);
-    case 'start_recording':
-      return handleStartRecording(args);
-    case 'stop_recording':
-      return handleStopRecording();
-    case 'capture':
-      return handleCapture(args);
-    case 'list_windows':
-      return handleListWindows();
-    case 'get_frame':
-      return handleGetFrame(args);
-    default:
-      throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32602 });
+  // params itself must be a well-formed tools/call. A missing/invalid tool name
+  // is a PROTOCOL error (the client sent a malformed request).
+  if (!params || typeof params !== 'object' || typeof params.name !== 'string') {
+    throw Object.assign(new Error('Invalid tools/call: `name` is required'), { code: -32602 });
+  }
+  const { name, arguments: rawArgs } = params;
+  // Arguments, when present, must be an object; tolerate omission.
+  const args = (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) ? rawArgs : {};
+
+  const dispatchTool = () => {
+    switch (name) {
+      case 'record':
+        return handleRecord(args);
+      case 'start_recording':
+        return handleStartRecording(args);
+      case 'stop_recording':
+        return handleStopRecording();
+      case 'capture':
+        return handleCapture(args);
+      case 'list_windows':
+        return handleListWindows();
+      case 'get_frame':
+        return handleGetFrame(args);
+      case 'status':
+        return handleStatus();
+      default:
+        // Unknown tool is a protocol-level error, not a tool-execution failure.
+        throw Object.assign(new Error(`Unknown tool: ${name}`), { code: -32602 });
+    }
+  };
+
+  // Tool-EXECUTION failures (capture backend errors, an unavailable window
+  // target, a missing frame, no recording in progress) are reported as tool
+  // results with isError:true — not as JSON-RPC protocol errors. That is the
+  // MCP contract: the model sees an actionable message and can recover, while
+  // the connection stays healthy. Only malformed protocol input (handled above
+  // and in jsonrpc.mjs) yields a JSON-RPC error.
+  try {
+    return await dispatchTool();
+  } catch (err) {
+    if (err && err.code === -32602) throw err; // genuine protocol error → propagate
+    return toolError(name, err);
   }
 });
 
@@ -238,6 +274,17 @@ async function handleGetFrame(args) {
   };
 }
 
+async function handleStatus() {
+  const s = recordingStatus();
+  const text = s.active
+    ? `A recording is in progress.\n` +
+      `Directory: ${s.dir}\nFrames so far: ${s.frameCount}\n` +
+      `Region: ${s.region}${s.title ? ` · "${s.title}"` : ''} at ${s.fps} fps.\n` +
+      `Call stop_recording to finish and get the contact sheet.`
+    : 'No recording is in progress. Call record (fixed duration) or start_recording (open-ended) to begin.';
+  return { content: [{ type: 'text', text }] };
+}
+
 async function handleListWindows() {
   const [windows, backend] = await Promise.all([listWindows(), detectBackend()]);
   const lines = windows.length
@@ -271,6 +318,19 @@ function imageContent(pngBuffer) {
     data: pngBuffer.toString('base64'),
     mimeType: 'image/png',
   };
+}
+
+// Turn a tool-execution failure into an MCP tool result with isError:true, so
+// the model receives an actionable message instead of a dropped request. A
+// TargetUnavailableError gets a hint to pick a different target.
+function toolError(toolName, err) {
+  const base = (err && err.message) ? err.message : String(err);
+  let text = `${toolName} failed: ${base}`;
+  if (err instanceof TargetUnavailableError) {
+    text += '\nUse list_windows to see available targets, or omit `title` and ' +
+      'use region "primary"/"virtual".';
+  }
+  return { content: [{ type: 'text', text }], isError: true };
 }
 
 // --- boot ------------------------------------------------------------------

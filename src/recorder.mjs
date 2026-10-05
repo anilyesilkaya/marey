@@ -1,12 +1,26 @@
-// Orchestrates a recording: wait an optional delay, capture frames at a fixed
-// rate for a fixed duration, write each frame + the composed contact sheet to
-// disk, and return metadata. Pure Node builtins only.
+// Recorder API — the stable surface the MCP server and CLI call.
+//
+// As of Phase 1 this is a thin ADAPTER over SessionController (src/session.mjs),
+// which owns recording state, lifecycle transitions, limits, and finalisation.
+// The function signatures here are unchanged so the existing MCP tools (record,
+// start_recording, stop_recording, capture, get_frame) and the CLI keep working;
+// the reliability guarantees now come from the controller:
+//   - "ready" means a verified first frame, not just a spawned backend;
+//   - duration is a monotonic deadline, not a frame count;
+//   - a single-active guard is acquired synchronously (no racing starts);
+//   - each session gets a unique directory;
+//   - memory is bounded (originals stream to disk; only metadata is retained);
+//   - finalisation runs once and is idempotent;
+//   - startup/stream/disk failures are preserved and reported.
+//
+// capture() and get_frame() are single-shot and do not need a session, so they
+// stay as direct, dependency-free helpers.
 
 import { mkdir, writeFile, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { captureFrame, captureBurst, startCaptureStream } from './capture.mjs';
+import { captureFrame } from './capture.mjs';
 import { encodePng, decodePng } from './png.mjs';
-import { composeContactSheet } from './contactsheet.mjs';
+import { SessionController } from './session.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -19,227 +33,107 @@ function stamp(date) {
   );
 }
 
-// Record the screen.
-//
-// opts: {
-//   seconds, fps, region, title, delay, cols, thumbWidth,
-//   outputDir  // base directory for captures (default: <cwd>/captures)
-// }
-//
-// Returns {
-//   dir, frameCount, fps, seconds, region, elapsedMs,
-//   contactSheetPath, latestPath, frames: [{ path, index, timeMs }],
-//   contactSheet: { width, height, buffer }
-// }
-export async function record(opts = {}) {
-  const seconds = clampNumber(opts.seconds, 5, 0.1, 120);
-  const fps = clampNumber(opts.fps, 2, 0.1, 60);
-  const region = opts.region || 'primary';
-  const title = opts.title;
-  const delay = clampNumber(opts.delay, 0, 0, 60);
-  // `detail` is a convenience preset for the overview-vs-legibility trade-off.
-  // A single returned image has a fixed resolution budget, so fewer columns +
-  // wider thumbnails = more readable per frame. Explicit cols/thumbWidth always
-  // win over the preset.
-  const detail = normalizeDetail(opts.detail);
-  const preset = DETAIL_PRESETS[detail];
-  const cols = Math.round(clampNumber(opts.cols, preset.cols, 1, 16));
-  const thumbWidth = Math.round(clampNumber(opts.thumbWidth, preset.thumbWidth, 64, 1920));
-  const baseDir = opts.outputDir || path.join(process.cwd(), 'captures');
+// One shared controller per process so record() and the open-ended session API
+// honour a single-active guard between them (one screen, one user → one capture
+// at a time). Created lazily, keyed on the base output directory: the real
+// callers (server, CLI) use the default, and an explicit, different outputDir is
+// honoured only while idle so a one-off directory override still works.
+let sharedController = null;
 
-  const totalFrames = Math.max(1, Math.round(seconds * fps));
-  const intervalMs = 1000 / fps;
+function controllerFor(outputDir) {
+  const baseDir = outputDir || path.join(process.cwd(), 'captures');
+  if (!sharedController) {
+    sharedController = new SessionController({ outputDir: baseDir });
+  } else if (outputDir && sharedController.baseDir !== baseDir && !sharedController.active) {
+    sharedController = new SessionController({ outputDir: baseDir });
+  }
+  return sharedController;
+}
 
-  if (delay > 0) await sleep(delay * 1000);
-
-  const started = new Date();
-  const dir = path.join(baseDir, stamp(started));
-  await mkdir(dir, { recursive: true });
-
-  const startTime = Date.now();
-
-  // Capture the whole burst first (at the real frame rate on Windows this runs
-  // in one process), then persist frames. Writing during capture would steal
-  // time from the capture loop and skew the frame rate.
-  const captured = await captureBurst({ region, title, frames: totalFrames, intervalMs });
-  const elapsedMs = Date.now() - startTime;
-
-  const frames = [];
-  const frameMeta = [];
-  const writes = [];
-
-  captured.forEach((frame, i) => {
-    const index = i + 1;
-    const { image, timeMs } = frame;
-    const buffer = encodePng(image.width, image.height, image.data);
-    const name = `frame_${String(index).padStart(3, '0')}_${String(Math.round(timeMs)).padStart(5, '0')}ms.png`;
-    const framePath = path.join(dir, name);
-    writes.push(writeFile(framePath, buffer));
-    frames.push({ image, index, timeMs });
-    frameMeta.push({ path: framePath, index, timeMs });
-  });
-
-  await Promise.all(writes);
-
-  const sheet = composeContactSheet(frames, { cols, thumbWidth });
-  const sheetBuffer = encodePng(sheet.width, sheet.height, sheet.data);
-  const contactSheetPath = path.join(dir, 'contactsheet.png');
-  await writeFile(contactSheetPath, sheetBuffer);
-
-  const latestPath = path.join(baseDir, 'latest-contactsheet.png');
-  await writeFile(latestPath, sheetBuffer);
-
+// Pass through controller options the recorder public API accepts.
+function captureOpts(opts) {
   return {
-    dir,
-    frameCount: frames.length,
-    fps,
-    seconds,
-    region,
-    title: title || null,
-    elapsedMs,
-    contactSheetPath,
-    latestPath,
-    cols,
-    thumbWidth,
-    detail,
-    frames: frameMeta,
-    contactSheet: { width: sheet.width, height: sheet.height, buffer: sheetBuffer },
+    fps: opts.fps,
+    region: opts.region,
+    title: opts.title,
+    delay: opts.delay,
+    detail: opts.detail,
+    cols: opts.cols,
+    thumbWidth: opts.thumbWidth,
   };
+}
+
+// A finalised controller result is a superset of the legacy record() shape
+// (dir, frameCount, fps, seconds, region, title, elapsedMs, contactSheetPath,
+// latestPath, cols, thumbWidth, detail, frames[], contactSheet{width,height,
+// buffer}). Return it when we have renderable evidence; otherwise surface the
+// recorded failure so the caller can report it.
+function resultOrThrow(result) {
+  if (result.contactSheet) return result;
+  const detail = result.errors && result.errors.length
+    ? `: ${result.errors.join('; ')}`
+    : '. The capture backend may have failed to start.';
+  throw new Error(`Recording captured no frames${detail}`);
+}
+
+// Record the screen for a fixed duration and return a contact sheet. See
+// SessionController.record for the timing/limit semantics.
+//
+// opts: { seconds, fps, region, title, delay, cols, thumbWidth, detail, outputDir }
+export async function record(opts = {}) {
+  const controller = controllerFor(opts.outputDir);
+  const result = await controller.record({ ...captureOpts(opts), seconds: opts.seconds });
+  return resultOrThrow(result);
 }
 
 // --- open-ended recording sessions -----------------------------------------
 //
 // start_recording / stop_recording let the user control timing: the agent
 // starts a capture stream on the user's cue, the user performs the interaction,
-// then the agent stops it and gets a contact sheet. Only one session may be
-// active at a time (the server serves a single user).
+// then the agent stops it and gets a contact sheet. The controller's
+// single-active guard enforces one session at a time.
 
-let activeSession = null;
-
-const MAX_SESSION_FRAMES = 600; // safety cap so a forgotten session cannot grow without bound
-
-// Begin an open-ended recording. Frames are captured at `fps` and written to
-// disk as they arrive. Returns { dir, fps, region, title }.
+// Begin an open-ended recording and resolve once a first valid frame is
+// captured (ready), or reject with the real startup failure. Returns
+// { dir, fps, region, title, detail }.
 export async function startRecording(opts = {}) {
-  if (activeSession) {
-    throw new Error(
-      `A recording is already in progress (started in ${activeSession.dir}, ` +
-      `${activeSession.frames.length} frames so far). Call stop_recording first.`
-    );
-  }
-
-  const fps = clampNumber(opts.fps, 2, 0.1, 60);
-  const region = opts.region || 'primary';
-  const title = opts.title;
-  const detail = normalizeDetail(opts.detail);
-  const preset = DETAIL_PRESETS[detail];
-  const cols = Math.round(clampNumber(opts.cols, preset.cols, 1, 16));
-  const thumbWidth = Math.round(clampNumber(opts.thumbWidth, preset.thumbWidth, 64, 1920));
-  const baseDir = opts.outputDir || path.join(process.cwd(), 'captures');
-  const delay = clampNumber(opts.delay, 0, 0, 60);
-  const intervalMs = 1000 / fps;
-
-  if (delay > 0) await sleep(delay * 1000);
-
-  const started = new Date();
-  const dir = path.join(baseDir, stamp(started));
-  await mkdir(dir, { recursive: true });
-
-  const session = {
-    dir, baseDir, fps, region, title: title || null,
-    detail, cols, thumbWidth,
-    frames: [],   // { image, index, timeMs }
-    writes: [],
-    capped: false,
-    stream: null,
+  const controller = controllerFor(opts.outputDir);
+  const started = await controller.start(captureOpts(opts));
+  return {
+    dir: started.dir,
+    fps: started.fps,
+    region: started.region,
+    title: started.title,
+    detail: started.detail,
   };
-
-  session.stream = startCaptureStream({ region, title, intervalMs }, (frame, count) => {
-    if (count > MAX_SESSION_FRAMES) {
-      if (!session.capped) {
-        session.capped = true;
-        session.stream.stop();
-      }
-      return;
-    }
-    const index = count;
-    const { image, timeMs } = frame;
-    const buffer = encodePng(image.width, image.height, image.data);
-    const name = `frame_${String(index).padStart(3, '0')}_${String(Math.round(timeMs)).padStart(5, '0')}ms.png`;
-    const framePath = path.join(dir, name);
-    session.writes.push(writeFile(framePath, buffer).catch(() => {}));
-    session.frames.push({ image, index, timeMs, path: framePath });
-  });
-
-  activeSession = session;
-  return { dir, fps, region, title: title || null, detail };
 }
 
 // Stop the active recording and compose a contact sheet. Returns the same shape
-// as record().
+// as record(). Errors if no recording is in progress.
 export async function stopRecording() {
-  const session = activeSession;
-  if (!session) {
+  if (!sharedController || !sharedController.active) {
     throw new Error('No recording is in progress. Call start_recording first.');
   }
-  activeSession = null;
-
-  await session.stream.stop();
-  await Promise.all(session.writes);
-
-  const streamError = session.stream.error;
-  if (session.frames.length === 0) {
-    throw new Error(
-      `Recording captured no frames${streamError ? `: ${streamError}` : ''}. ` +
-      `The capture backend may have failed to start.`
-    );
-  }
-
-  const frames = session.frames.map((f) => ({ image: f.image, index: f.index, timeMs: f.timeMs }));
-  const frameMeta = session.frames.map((f) => ({ path: f.path, index: f.index, timeMs: f.timeMs }));
-  const elapsedMs = frames.length ? frames[frames.length - 1].timeMs : 0;
-
-  const sheet = composeContactSheet(frames, { cols: session.cols, thumbWidth: session.thumbWidth });
-  const sheetBuffer = encodePng(sheet.width, sheet.height, sheet.data);
-  const contactSheetPath = path.join(session.dir, 'contactsheet.png');
-  await writeFile(contactSheetPath, sheetBuffer);
-
-  const latestPath = path.join(session.baseDir, 'latest-contactsheet.png');
-  await writeFile(latestPath, sheetBuffer);
-
-  return {
-    dir: session.dir,
-    frameCount: frames.length,
-    fps: session.fps,
-    seconds: elapsedMs / 1000,
-    region: session.region,
-    title: session.title,
-    elapsedMs,
-    capped: session.capped,
-    contactSheetPath,
-    latestPath,
-    cols: session.cols,
-    thumbWidth: session.thumbWidth,
-    detail: session.detail,
-    frames: frameMeta,
-    contactSheet: { width: sheet.width, height: sheet.height, buffer: sheetBuffer },
-  };
+  const result = await sharedController.stop();
+  return resultOrThrow(result);
 }
 
 // Report whether a recording is active (for status / diagnostics).
 export function recordingStatus() {
-  if (!activeSession) return { active: false };
+  if (!sharedController) return { active: false };
+  const s = sharedController.status();
+  if (!s.active) return { active: false };
   return {
     active: true,
-    dir: activeSession.dir,
-    frameCount: activeSession.frames.length,
-    fps: activeSession.fps,
-    region: activeSession.region,
-    title: activeSession.title,
+    dir: s.dir,
+    frameCount: s.frameCount,
+    fps: s.fps,
+    region: s.region,
+    title: s.title,
   };
 }
 
-// Capture a single frame and write it to disk.
+// Capture a single frame and write it to disk. Single-shot: no session needed.
 export async function capture(opts = {}) {
   const region = opts.region || 'primary';
   const title = opts.title;
@@ -331,23 +225,4 @@ function clampNumber(value, fallback, min, max) {
   const n = typeof value === 'number' ? value : parseFloat(value);
   if (!Number.isFinite(n)) return fallback;
   return Math.min(max, Math.max(min, n));
-}
-
-// Map the `detail` preset to a (cols, thumbWidth) pair. A returned image has a
-// fixed resolution budget that is split across columns, so legibility comes
-// from fewer, wider cells — not from thumbWidth alone.
-//
-//   overview (default) — many frames at a glance; small cells
-//   high               — fewer, larger cells; UI text usually readable
-//   max                — one column, full-width cells; closest to raw frames
-const DETAIL_PRESETS = {
-  overview: { cols: 4, thumbWidth: 480 },
-  high: { cols: 2, thumbWidth: 760 },
-  max: { cols: 1, thumbWidth: 1280 },
-};
-
-function normalizeDetail(detail) {
-  if (!detail) return 'overview';
-  const key = String(detail).toLowerCase();
-  return DETAIL_PRESETS[key] ? key : 'overview';
 }
