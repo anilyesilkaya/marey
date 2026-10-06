@@ -65,6 +65,9 @@ function captureOpts(opts) {
     detail: opts.detail,
     cols: opts.cols,
     thumbWidth: opts.thumbWidth,
+    // Replay (Phase 4): arm a rolling ring buffer and set its look-back window.
+    replay: opts.replay,
+    windowMs: opts.windowMs,
   };
 }
 
@@ -191,6 +194,93 @@ export async function observe(opts = {}) {
     await control.close().catch(() => {});
   }
   return result;
+}
+
+// --- replay: rolling buffer + markers (instant-replay / dashcam) ------------
+//
+// replay() is the Phase-4 workflow for "it just did the thing — grab that".
+// Instead of recording from a start cue, it keeps only the last `windowSeconds`
+// of frames in a rolling ring buffer (older unpinned frames are evicted from
+// disk), so an arbitrarily long session stays bounded. Whenever the user clicks
+// MARK (or runs `marey mark`), the frames currently in the window are pinned and
+// saved as a clip; each mark yields its own clip. Finish/Cancel ends it and
+// composes one contact sheet per clip.
+//
+// Like observe() this BLOCKS until the user finishes/cancels or the max-duration
+// safety deadline fires. opts: capture opts + { windowSeconds (ring-buffer
+// look-back, default from limits), maxSeconds, open, outputDir, onUrl }.
+//
+// Returns a record()-shaped result with `clips` (each with its own contactSheet)
+// and an `observation` field ('finished' | 'cancelled' | 'timed-out').
+export async function replay(opts = {}) {
+  const controller = controllerFor(opts.outputDir);
+  const maxSeconds = clampNumber(opts.maxSeconds, 600, 1, 1800);
+  const windowMs = opts.windowSeconds != null
+    ? clampNumber(opts.windowSeconds, 20, 1, 120) * 1000
+    : undefined;
+
+  // Arm the rolling buffer first: if the backend cannot produce a frame, fail
+  // now (before opening a browser the user would stare at for nothing).
+  const started = await controller.start({ ...captureOpts(opts), replay: true, windowMs });
+
+  const control = createControlServer({
+    title: 'Marey replay',
+    instructions:
+      'Reproduce the issue, then click Mark to save the last few seconds. ' +
+      'Mark as many times as you need, then click Finish.',
+    getStatus: () => {
+      const s = controller.status(started.sessionId);
+      return {
+        frameCount: s.frameCount ?? 0,
+        elapsedMs: s.elapsedMs ?? 0,
+        region: s.region,
+        title: s.title,
+        fps: s.fps,
+        markCount: s.markCount ?? 0,
+      };
+    },
+    // Mark pins the current look-back window into a clip; recording continues.
+    onMark: () => controller.mark(started.sessionId),
+  });
+
+  let result;
+  try {
+    await control.listen();
+    writeControlRegistry(control, {
+      sessionId: started.sessionId, startedAt: started.startedAt, mode: 'replay',
+    });
+
+    const opened = opts.open === false ? false : openBrowser(control.url);
+    if (typeof opts.onUrl === 'function') opts.onUrl(control.url, opened);
+
+    const timer = setTimeout(() => control.settle('timed-out'), maxSeconds * 1000);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    const outcome = await control.outcome;
+    clearTimeout(timer);
+
+    // Finish/timeout → stop (keep clips); Cancel → cancel (still composes clips
+    // from whatever was pinned, flagged as cancelled).
+    const raw = outcome === 'cancelled'
+      ? await controller.cancel(started.sessionId)
+      : await controller.stop(started.sessionId, { reason: outcome });
+
+    result = { ...replayResultOrThrow(raw), observation: outcome };
+  } finally {
+    clearControlRegistry();
+    await control.close().catch(() => {});
+  }
+  return result;
+}
+
+// A replay result is valid if it produced at least one clip with a contact
+// sheet; otherwise surface the recorded failure (no frames / all evicted).
+function replayResultOrThrow(result) {
+  if (result.clips && result.clips.some((c) => c.contactSheet)) return result;
+  const detail = result.errors && result.errors.length
+    ? `: ${result.errors.join('; ')}`
+    : '. No frames were captured, or the backend failed to start.';
+  throw new Error(`Replay produced no clips${detail}`);
 }
 
 // Report whether a recording is active (for status / diagnostics).

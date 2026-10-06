@@ -154,11 +154,13 @@ test('end-to-end: initialize, tools/list, and a failing tool returns isError', a
 
     const list = await srv.rpc(2, 'tools/list', {});
     const names = list.result.tools.map((t) => t.name);
-    // The six baseline tools are preserved, plus the new status tool.
+    // The six baseline tools are preserved, plus the status/observe/replay tools.
     for (const n of ['record', 'capture', 'start_recording', 'stop_recording', 'list_windows', 'get_frame']) {
       assert.ok(names.includes(n), `tool ${n} must still be registered`);
     }
     assert.ok(names.includes('status'), 'status tool should be available');
+    assert.ok(names.includes('observe'), 'observe tool should be available');
+    assert.ok(names.includes('replay'), 'replay tool should be available');
 
     // stop_recording with nothing in progress is a TOOL failure → isError:true,
     // NOT a JSON-RPC protocol error.

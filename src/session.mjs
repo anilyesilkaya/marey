@@ -48,6 +48,13 @@ export const DEFAULT_LIMITS = {
   maxOutputBytes: 3_500_000,  // cap on encoded sheet bytes (≈4.8 MB base64, under
                               // the ~5 MB inline-image limit most MCP clients enforce)
   shutdownTimeoutMs: 5_000,   // max wait for the capture worker to stop
+  // Replay (Phase 4): a rolling ring buffer keeps only the last `replayWindowMs`
+  // of frames so an arbitrarily long armed session stays bounded; a marker pins
+  // the current window into a clip that eviction must not delete.
+  replayWindowMs: 20_000,     // default look-back window for a replay marker
+  maxReplayWindowMs: 120_000, // hard cap on a requested replay window
+  maxReplaySessionMs: 1_800_000, // safety deadline for an armed replay (30 min)
+  maxClips: 12,               // cap on markers (clips) retained per replay session
 };
 
 // Explicit lifecycle states. `armed` is reserved for the Phase 4 replay buffer.
@@ -127,6 +134,9 @@ export class SessionController {
       startedAt: s.startedWall ? s.startedWall.toISOString() : null,
       elapsedMs: s.state === STATES.RECORDING ? Math.round(this.clock.now() - s.startMono) : null,
       requestedMs: s.durationMs,
+      replay: !!s.replay,
+      windowMs: s.replayWindowMs || null,
+      markCount: s.clips ? s.clips.length : 0,
     };
   }
 
@@ -160,9 +170,22 @@ export class SessionController {
     const durationMs = timed
       ? clampNumber(opts.durationMs, 5000, 100, this.limits.maxTimedMs)
       : null;
+
+    // Replay mode (Phase 4): a rolling ring buffer keeps only the last
+    // `replayWindowMs` of frames, evicting (and deleting) older ones unless a
+    // marker has pinned them. Because disk stays bounded by eviction, a replay
+    // session may run far longer than an ordinary open-ended one.
+    const replay = !!opts.replay && !timed;
+    const replayWindowMs = replay
+      ? clampNumber(opts.windowMs, this.limits.replayWindowMs, 1000, this.limits.maxReplayWindowMs)
+      : null;
+
     // Every session has a hard deadline so a stalled/zero-frame backend cannot
-    // run forever: timed → its duration; open-ended → the session safety cap.
-    const deadlineMs = timed ? durationMs : this.limits.maxSessionMs;
+    // run forever: timed → its duration; replay → a longer bounded cap (disk is
+    // held in check by eviction); plain open-ended → the session safety cap.
+    const deadlineMs = timed
+      ? durationMs
+      : (replay ? this.limits.maxReplaySessionMs : this.limits.maxSessionMs);
 
     const startedWall = this.clock.wall();
     const id = makeSessionId(startedWall);
@@ -174,8 +197,13 @@ export class SessionController {
       state: STATES.STARTING,
       region, title, fps, intervalMs, detail, cols, thumbWidth,
       timed, durationMs, deadlineMs,
+      replay, replayWindowMs,
+      clips: [],           // replay markers → { markIndex, markedAtMs, frames[] }
+      evictedCount: 0,     // frames deleted by ring-buffer eviction (reporting)
       startedWall, startMono: this.clock.now(),
-      frames: [],          // { index, timeMs, path, bytes, width, height, written }
+      frames: [],          // { index, timeMs, path, bytes, width, height, written, pinned }
+      frameSeq: 0,         // monotonic frame counter (indices never reused, even
+                           // after ring-buffer eviction splices entries out)
       writes: [],          // in-flight write promises
       warnings: [], errors: [],
       diskBytes: 0,
@@ -213,6 +241,8 @@ export class SessionController {
         backend: this.backend.name,
         timed,
         requestedSeconds: timed ? durationMs / 1000 : null,
+        replay,
+        windowMs: replayWindowMs,
       };
     } catch (err) {
       // Startup failed: record it, finalise as failed, release the guard. Tag
@@ -337,7 +367,7 @@ export class SessionController {
     session._firstFrameSeen = true;
     session._markReady && session._markReady();
 
-    const index = session.frames.length + 1;
+    const index = ++session.frameSeq;
     const name = `frame_${String(index).padStart(3, '0')}_${String(Math.round(frame.timeMs)).padStart(5, '0')}ms.png`;
     const framePath = path.join(session.dir, name);
     const entry = {
@@ -349,8 +379,22 @@ export class SessionController {
     session.diskBytes += frame.png.length;
     session.lastFrameMono = this.clock.now();
 
+    // Replay ring buffer: once a new frame lands, drop frames that have aged out
+    // of the look-back window and are not pinned by a marker. Keeps an armed
+    // session bounded on disk no matter how long it runs.
+    if (session.replay) this._evictAged(session, frame.timeMs);
+
     const w = this.fs.writeFile(framePath, frame.png).then(
-      () => { entry.written = true; session._writeFailStreak = 0; },
+      () => {
+        entry.written = true;
+        session._writeFailStreak = 0;
+        // If the ring buffer evicted this frame while its write was still in
+        // flight, the file would otherwise land on disk untracked (a leak that
+        // defeats the whole point of eviction). Delete it now that it exists.
+        if (entry.evicted && this.fs.unlink) {
+          this.fs.unlink(entry.path).catch(() => {});
+        }
+      },
       (err) => {
         // Disk write failed: do NOT advertise a frame file that was never
         // written. Record it so the failure is visible, reclaim its budget, and
@@ -367,6 +411,81 @@ export class SessionController {
       },
     );
     session.writes.push(w);
+  }
+
+  // Ring-buffer eviction for a replay session: drop frames older than the
+  // look-back window from the newest frame, unless a marker has pinned them.
+  // Pinned frames (and anything newer than the cutoff) are retained. Evicted
+  // files are deleted from disk and their bytes reclaimed, so disk use stays
+  // bounded by (window × fps × frame size) rather than growing without limit.
+  _evictAged(session, newestTimeMs) {
+    const cutoff = newestTimeMs - session.replayWindowMs;
+    const kept = [];
+    for (const f of session.frames) {
+      if (f.pinned || f.timeMs >= cutoff) {
+        kept.push(f);
+        continue;
+      }
+      // Aged out and unpinned → delete the on-disk file and reclaim budget.
+      session.evictedCount++;
+      session.diskBytes -= f.bytes;
+      if (f.written && this.fs.unlink) {
+        this.fs.unlink(f.path).catch((e) => {
+          // A failed unlink is non-fatal: the disk cap is the hard backstop.
+          if (!session._evictWarned) {
+            session._evictWarned = true;
+            session.warnings.push(`Ring-buffer eviction could not delete a frame: ${e.message}`);
+          }
+        });
+      } else if (!f.written) {
+        // Write still in flight: tag it so the write handler deletes the file
+        // once it lands, rather than leaking an untracked frame on disk.
+        f.evicted = true;
+      }
+    }
+    session.frames = kept;
+  }
+
+  // Drop a marker: snapshot the frames currently in the look-back window into a
+  // clip and PIN them so eviction never deletes them. Repeatable — each mark
+  // yields its own clip. A mark with an empty buffer is a no-op (warned once).
+  // Returns { markIndex, markedAtMs, frameCount } for the caller/control page.
+  mark(sessionId) {
+    const s = this._resolveSession(sessionId);
+    if (!s) throw new Error('No recording is in progress to mark.');
+    if (!s.replay) throw new Error('mark is only valid for a replay session.');
+    if (s.state !== STATES.RECORDING) {
+      return { markIndex: s.clips.length, markedAtMs: null, frameCount: 0, note: 'not recording' };
+    }
+
+    const newest = s.frames.length ? s.frames[s.frames.length - 1].timeMs : 0;
+    const cutoff = newest - s.replayWindowMs;
+    const windowFrames = s.frames.filter((f) => f.timeMs >= cutoff);
+    if (windowFrames.length === 0) {
+      if (!s._emptyMarkWarned) {
+        s._emptyMarkWarned = true;
+        s.warnings.push('A marker was dropped before any frame was buffered; ignored.');
+      }
+      return { markIndex: s.clips.length, markedAtMs: newest, frameCount: 0 };
+    }
+
+    if (s.clips.length >= this.limits.maxClips) {
+      if (!s._clipCapWarned) {
+        s._clipCapWarned = true;
+        s.warnings.push(`Marker cap reached (${this.limits.maxClips}); further markers are ignored.`);
+      }
+      return { markIndex: s.clips.length, markedAtMs: newest, frameCount: 0, note: 'clip-cap' };
+    }
+
+    for (const f of windowFrames) f.pinned = true; // survive future eviction
+    const clip = {
+      markIndex: s.clips.length + 1,
+      markedAtMs: newest,
+      windowMs: s.replayWindowMs,
+      frames: windowFrames.slice(),
+    };
+    s.clips.push(clip);
+    return { markIndex: clip.markIndex, markedAtMs: newest, frameCount: windowFrames.length };
   }
 
   // Arm the monotonic duration deadline. When it fires, finalisation begins —
@@ -466,9 +585,28 @@ export class SessionController {
       let contactSheetPath = null;
       let latestPath = null;
       let composeWarning = null;
+      let clips = null;
       let finalState = terminalState;
 
-      if (committed.length > 0) {
+      if (session.replay) {
+        // Replay session: compose one contact sheet per marker (clip). A session
+        // with no markers falls back to the current window as one implicit clip.
+        try {
+          clips = await this._composeClips(session, committed);
+          const primary = clips.find((c) => c.contactSheet);
+          if (primary) {
+            // Mirror the first clip's sheet into the top-level fields so a
+            // non-replay-aware consumer still gets one usable contact sheet.
+            contactSheet = primary.contactSheet;
+            contactSheetPath = primary.contactSheetPath;
+            latestPath = path.join(session.baseDir, 'latest-contactsheet.png');
+          }
+        } catch (err) {
+          composeWarning = `Replay clip composition failed: ${err.message}`;
+          session.errors.push(composeWarning);
+          finalState = STATES.FAILED;
+        }
+      } else if (committed.length > 0) {
         try {
           const built = await this._composeFromDisk(session, committed);
           contactSheet = built.contactSheet;
@@ -491,7 +629,7 @@ export class SessionController {
       session.state = finalState;
       const elapsedMs = committed.length ? committed[committed.length - 1].timeMs : 0;
       const result = this._buildResult(session, committed, {
-        reason, elapsedMs, contactSheet, contactSheetPath, latestPath,
+        reason, elapsedMs, contactSheet, contactSheetPath, latestPath, clips,
       });
       session.result = result;
 
@@ -522,23 +660,37 @@ export class SessionController {
   //   3. The composed cell count and analysis cost are both bounded so a long
   //      session cannot allocate a giant image or decode unbounded frames.
   async _composeFromDisk(session, committed) {
+    const built = await this._selectAndCompose(session, committed, this.limits.maxOutputBytes);
+    const sheetBuffer = built.contactSheet.buffer;
+    const contactSheetPath = path.join(session.dir, 'contactsheet.png');
+    await this.fs.writeFile(contactSheetPath, sheetBuffer);
+    const latestPath = path.join(session.baseDir, 'latest-contactsheet.png');
+    await this.fs.writeFile(latestPath, sheetBuffer).catch(() => {});
+    return { contactSheet: built.contactSheet, contactSheetPath, latestPath, warning: built.warning };
+  }
+
+  // Select informative frames (Phase 3) and compose a single budget-fitted
+  // sheet from them, returning the composed image + metadata WITHOUT writing it
+  // to disk. Shared by the single-sheet path and the per-clip replay path, so
+  // both get the same selection + budget behaviour. `maxBytes` is the byte
+  // ceiling for THIS sheet (replay divides the global budget across clips).
+  async _selectAndCompose(session, pool, maxBytes) {
     const maxCells = this.limits.maxComposeFrames;
 
     // --- 1. selection -------------------------------------------------------
-    let selected = committed;
+    let selected = pool;
     let selectionNote = null;
-    if (committed.length > maxCells) {
-      // Decode a bounded candidate pool to measure frame-to-frame change, then
+    if (pool.length > maxCells) {
+      // Decode a bounded candidate set to measure frame-to-frame change, then
       // choose the most informative cells. Pixels are discarded after the tiny
-      // signatures (bounded memory); selected frames are re-read below. This
-      // extra decode pass is only paid when a selection is actually needed.
-      const pool = committed.length > this.limits.maxAnalysisFrames
-        ? evenSample(committed, this.limits.maxAnalysisFrames)
-        : committed;
-      const { entries, sigs } = await this._signaturesFor(pool);
+      // signatures (bounded memory); selected frames are re-read below.
+      const analysed = pool.length > this.limits.maxAnalysisFrames
+        ? evenSample(pool, this.limits.maxAnalysisFrames)
+        : pool;
+      const { entries, sigs } = await this._signaturesFor(analysed);
       selected = entries.length > maxCells ? selectByChange(entries, sigs, maxCells) : entries;
       selectionNote =
-        `Contact sheet shows ${selected.length} of ${committed.length} frames ` +
+        `Shows ${selected.length} of ${pool.length} frames ` +
         `(selected by visual change); all frames remain on disk (use get_frame).`;
     }
 
@@ -562,34 +714,87 @@ export class SessionController {
       cols: session.cols,
       thumbWidth: session.thumbWidth,
       maxPixels: this.limits.maxOutputPixels,
-      maxBytes: this.limits.maxOutputBytes,
+      maxBytes,
       encode: (img) => encodePng(img.width, img.height, img.data),
     });
 
-    const sheetBuffer = built.buffer;
-    const contactSheetPath = path.join(session.dir, 'contactsheet.png');
-    await this.fs.writeFile(contactSheetPath, sheetBuffer);
-    const latestPath = path.join(session.baseDir, 'latest-contactsheet.png');
-    await this.fs.writeFile(latestPath, sheetBuffer).catch(() => {});
-
     const warning = [selectionNote, built.warning].filter(Boolean).join(' ') || null;
-
-    // The frame numbers actually shown on the sheet (the budget loop may have
-    // dropped some of the selected frames); captions on the image match these.
-    const composedIndices = built.selected.map((f) => f.index);
-
     return {
       contactSheet: {
         width: built.image.width,
         height: built.image.height,
-        buffer: sheetBuffer,
+        buffer: built.buffer,
         thumbWidth: built.thumbWidth,
         cols: built.cols,
         composedFrames: built.frameCount,
-        composedIndices,
+        composedIndices: built.selected.map((f) => f.index),
       },
-      contactSheetPath, latestPath, warning,
+      warning,
     };
+  }
+
+  // Compose one contact sheet per replay marker (clip). The global output-byte
+  // budget is divided across the clips shown (bounded by maxClips) so the TOTAL
+  // MCP response stays under the client's inline-image cap. A session with no
+  // markers falls back to the final look-back window as one implicit clip, so
+  // Finish without a mark still returns the most recent motion. Each clip's
+  // frames stay on disk; their indices are reported for get_frame.
+  async _composeClips(session, committed) {
+    // Determine the clip definitions: explicit markers, or one implicit clip
+    // from the surviving window if the user finished without marking.
+    let defs = session.clips;
+    let implicit = false;
+    if (defs.length === 0) {
+      if (committed.length === 0) return [];
+      defs = [{ markIndex: 1, markedAtMs: committed[committed.length - 1].timeMs, frames: committed }];
+      implicit = true;
+      session.warnings.push(
+        'Replay finished with no marker; showing the final ' +
+        `${Math.round(session.replayWindowMs / 1000)}s window as one clip.`
+      );
+    }
+
+    const shown = Math.min(defs.length, this.limits.maxClips);
+    if (defs.length > shown) {
+      session.warnings.push(`Showing ${shown} of ${defs.length} markers (clip cap).`);
+    }
+    // Split the byte budget across the clips shown (min floor so each is usable).
+    const perClipBytes = Math.max(400_000, Math.floor(this.limits.maxOutputBytes / shown));
+
+    const clips = [];
+    let latestPath = null; // first composed clip is mirrored to latest-contactsheet.png
+    for (let i = 0; i < shown; i++) {
+      const def = defs[i];
+      // Only frames that actually made it to disk can be composed.
+      const clipCommitted = def.frames.filter((f) => f.written);
+      if (clipCommitted.length === 0) continue;
+      let built;
+      try {
+        built = await this._selectAndCompose(session, clipCommitted, perClipBytes);
+      } catch (err) {
+        session.warnings.push(`Clip ${def.markIndex} could not be composed: ${err.message}`);
+        continue;
+      }
+      const sheetName = implicit ? 'contactsheet.png' : `clip_${String(def.markIndex).padStart(2, '0')}.png`;
+      const sheetPath = path.join(session.dir, sheetName);
+      await this.fs.writeFile(sheetPath, built.contactSheet.buffer);
+      if (latestPath === null) {
+        latestPath = path.join(session.baseDir, 'latest-contactsheet.png');
+        await this.fs.writeFile(latestPath, built.contactSheet.buffer).catch(() => {});
+      }
+      clips.push({
+        markIndex: def.markIndex,
+        markedAtMs: def.markedAtMs,
+        windowMs: def.windowMs || session.replayWindowMs,
+        frameCount: clipCommitted.length,
+        frames: clipCommitted.map((f) => ({ path: f.path, index: f.index, timeMs: f.timeMs })),
+        contactSheet: built.contactSheet,
+        contactSheetPath: sheetPath,
+        warning: built.warning,
+      });
+      if (built.warning) session.warnings.push(`Clip ${def.markIndex}: ${built.warning}`);
+    }
+    return clips;
   }
 
   // Decode each frame in a candidate pool once to compute a cheap grayscale
@@ -657,6 +862,14 @@ export class SessionController {
       latestPath: extra.latestPath,
       frames: committed.map((f) => ({ path: f.path, index: f.index, timeMs: f.timeMs })),
       contactSheet: extra.contactSheet,
+      // Replay (Phase 4): per-marker clips, each with its own contact sheet. Null
+      // for a normal (non-replay) recording. The first clip's sheet is mirrored
+      // into the top-level contactSheet above so existing single-sheet consumers
+      // keep working; a replay-aware consumer emits one image per clip.
+      replay: !!session.replay,
+      evictedFrames: session.replay ? session.evictedCount : null,
+      markCount: extra.clips ? extra.clips.length : null,
+      clips: extra.clips || null,
     };
   }
 

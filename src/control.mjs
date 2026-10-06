@@ -40,7 +40,13 @@ const LOOPBACK = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
 export function createControlServer(opts = {}) {
   const token = opts.token || randomBytes(16).toString('hex');
   const getStatus = typeof opts.getStatus === 'function' ? opts.getStatus : () => ({});
+  // onMark (Phase 4 replay): when provided, the page shows a repeatable MARK
+  // button and the /mark endpoint is live. Unlike finish/cancel, a mark does NOT
+  // settle the outcome — the recording continues so more marks can be dropped.
+  const onMark = typeof opts.onMark === 'function' ? opts.onMark : null;
   const title = opts.title || 'Marey';
+  const instructions = opts.instructions ||
+    'Reproduce the issue, then click Finish. This returns the frames to the agent.';
 
   let settled = false;
   let resolveOutcome;
@@ -74,7 +80,9 @@ export function createControlServer(opts = {}) {
     // page (status 200 so a drive-by cannot probe token validity via status).
     if (req.method === 'GET' && url.pathname === '/') {
       res.writeHead(200, htmlHeaders());
-      res.end(qToken === token ? controlPage(token, title) : invalidPage());
+      res.end(qToken === token
+        ? controlPage(token, title, { marking: !!onMark, instructions })
+        : invalidPage());
       return;
     }
 
@@ -85,6 +93,20 @@ export function createControlServer(opts = {}) {
       try { payload = getStatus() || {}; } catch { payload = {}; }
       res.writeHead(200, jsonHeaders());
       res.end(JSON.stringify({ ...payload, settled }));
+      return;
+    }
+
+    // Mark (Phase 4 replay): pin the current look-back window into a clip. Unlike
+    // finish/cancel this does NOT settle the outcome — recording continues so the
+    // user can drop more markers. Token-guarded in a custom header (CSRF-safe),
+    // and only live when an onMark handler was supplied.
+    if (req.method === 'POST' && url.pathname === '/mark') {
+      if (hToken !== token) { res.writeHead(403, jsonHeaders()).end('{"error":"forbidden"}'); return; }
+      if (!onMark) { res.writeHead(404, jsonHeaders()).end('{"error":"marking not enabled"}'); return; }
+      let info = {};
+      try { info = onMark() || {}; } catch (e) { info = { error: e.message }; }
+      res.writeHead(200, jsonHeaders());
+      res.end(JSON.stringify({ ok: true, ...info }));
       return;
     }
 
@@ -181,8 +203,17 @@ This Marey control link is invalid or has expired. You can close this tab.
 // click here, by `marey finish`, or by the server-side timeout), shows a final
 // message. The token is inlined so the page's own fetches can authenticate; it
 // is sent in the X-Marey-Token header on POSTs.
-function controlPage(token, title) {
+//
+// When `marking` is true (Phase 4 replay) the page also shows a repeatable MARK
+// button (M / Space) that pins the current look-back window into a clip WITHOUT
+// ending the recording, and a running marker count.
+function controlPage(token, title, opts = {}) {
+  const marking = !!opts.marking;
+  const instructions = opts.instructions || 'Reproduce the issue, then click Finish. This returns the frames to the agent.';
   // token is hex from randomBytes, so it is safe to inline inside a JS string.
+  const markButton = marking
+    ? `<button class="mark" id="mark">Mark &nbsp;·&nbsp; M</button>\n      `
+    : '';
   return `<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -196,13 +227,17 @@ function controlPage(token, title) {
   .dot { display:inline-block; width:11px; height:11px; border-radius:50%; background:#e5484d;
          margin-right:8px; animation:pulse 1.2s infinite; vertical-align:middle; }
   @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
+  @keyframes flash { 0%{background:#3b5bdb} 100%{background:#2a2a2e} }
   h1 { font-size:17px; margin:0 0 4px; font-weight:600; letter-spacing:.2px; }
   .meta { color:#9a9aa2; font-size:13px; margin-bottom:22px; min-height:1.4em; }
   .clock { font-size:40px; font-variant-numeric:tabular-nums; margin:6px 0 2px; }
+  .marks { color:#9bb0ff; font-size:13px; min-height:1.4em; margin-bottom:6px; }
   button { font:inherit; cursor:pointer; border:0; border-radius:10px; padding:12px 18px;
            margin:6px 4px; min-width:130px; }
   .finish { background:#2e7d32; color:#fff; font-weight:600; }
   .cancel { background:#2a2a2e; color:#d6d6da; }
+  .mark { background:#3b5bdb; color:#fff; font-weight:600; }
+  .mark.flash { animation:flash .4s ease-out; }
   .hint { color:#75757c; font-size:12px; margin-top:14px; }
   .done { color:#8fd19e; font-weight:600; }
 </style></head>
@@ -211,21 +246,32 @@ function controlPage(token, title) {
     <div><span class="dot" id="dot"></span><span id="state">Recording</span></div>
     <div class="clock" id="clock">00:00</div>
     <div class="meta" id="meta">starting…</div>
+    ${marking ? '<div class="marks" id="marks">No markers yet</div>' : ''}
     <div>
-      <button class="finish" id="finish">Finish &nbsp;·&nbsp; F</button>
+      ${markButton}<button class="finish" id="finish">Finish &nbsp;·&nbsp; F</button>
       <button class="cancel" id="cancel">Cancel &nbsp;·&nbsp; Esc</button>
     </div>
-    <div class="hint">Reproduce the issue, then click Finish. This returns the frames to the agent.</div>
+    <div class="hint">${escapeHtml(instructions)}</div>
   </div>
 <script>
   const TOKEN = ${JSON.stringify(token)};
+  const MARKING = ${marking ? 'true' : 'false'};
   const $ = (id) => document.getElementById(id);
   let done = false;
+  let markCount = 0;
 
   function fmt(ms) {
     if (!(ms >= 0)) ms = 0;
     const s = Math.floor(ms / 1000), m = Math.floor(s / 60);
     return String(m).padStart(2,'0') + ':' + String(s % 60).padStart(2,'0');
+  }
+
+  function renderMarks(n) {
+    if (!MARKING) return;
+    markCount = n;
+    $('marks').textContent = n > 0
+      ? n + ' marker' + (n===1?'':'s') + ' saved'
+      : 'No markers yet — Mark to save the last few seconds';
   }
 
   async function poll() {
@@ -240,6 +286,7 @@ function controlPage(token, title) {
       if (s.region) bits.push(s.region + (s.title ? ' · "'+s.title+'"' : ''));
       if (s.fps) bits.push(s.fps + ' fps');
       $('meta').textContent = bits.join(' · ') || 'recording…';
+      if (MARKING && typeof s.markCount === 'number' && s.markCount !== markCount) renderMarks(s.markCount);
     } catch (e) { /* server likely closed after settle */ }
     setTimeout(poll, 500);
   }
@@ -251,6 +298,7 @@ function controlPage(token, title) {
     $('state').textContent = 'Done';
     $('meta').innerHTML = '<span class="done">' + label + '</span> — you can close this tab.';
     $('finish').disabled = true; $('cancel').disabled = true;
+    if (MARKING) $('mark').disabled = true;
   }
 
   async function act(path, label) {
@@ -262,11 +310,25 @@ function controlPage(token, title) {
     finishedUI(label);
   }
 
+  // Mark does NOT end the recording — fire-and-refresh the marker count.
+  async function mark() {
+    if (done) return;
+    const btn = $('mark');
+    btn.classList.remove('flash'); void btn.offsetWidth; btn.classList.add('flash');
+    try {
+      const r = await fetch('/mark', { method:'POST', headers:{ 'X-Marey-Token': TOKEN } });
+      const j = await r.json().catch(() => ({}));
+      if (typeof j.markIndex === 'number' && j.markIndex > markCount) renderMarks(j.markIndex);
+    } catch (e) {}
+  }
+
   $('finish').onclick = () => act('/finish', 'Finished');
   $('cancel').onclick = () => act('/cancel', 'Cancelled');
+  if (MARKING) $('mark').onclick = mark;
   document.addEventListener('keydown', (e) => {
     if (e.key === 'f' || e.key === 'F' || e.key === 'Enter') act('/finish', 'Finished');
     else if (e.key === 'Escape') act('/cancel', 'Cancelled');
+    else if (MARKING && (e.key === 'm' || e.key === 'M' || e.key === ' ')) { e.preventDefault(); mark(); }
   });
   poll();
 </script>
@@ -316,23 +378,29 @@ export function clearControlRegistry() {
   try { unlinkSync(registryPath()); } catch {}
 }
 
-// Signal the live observation (from another process) to finish or cancel. POSTs
-// to the registered loopback endpoint with the token header. Returns
+// Signal the live observation (from another process) to finish, cancel, or mark.
+// POSTs to the registered loopback endpoint with the token header. Returns
 // { ok, reason } on success or { ok:false, error } if nothing is reachable.
+// A 'mark' pins the current replay window into a clip and leaves the recording
+// running; finish/cancel end it. The response body (e.g. markIndex, frameCount)
+// is merged in so callers can report what happened.
 export async function signalControl(action = 'finish') {
   const reg = readControlRegistry();
   if (!reg || !reg.port || !reg.token) {
     return { ok: false, error: 'No active observation found.' };
   }
-  const route = action === 'cancel' ? '/cancel' : '/finish';
+  const route = action === 'cancel' ? '/cancel' : action === 'mark' ? '/mark' : '/finish';
   try {
     const res = await fetch(`http://127.0.0.1:${reg.port}${route}`, {
       method: 'POST',
       headers: { 'X-Marey-Token': reg.token },
     });
+    if (res.status === 404 && action === 'mark') {
+      return { ok: false, error: 'This observation is not a replay session; nothing to mark.' };
+    }
     if (!res.ok) return { ok: false, error: `Control server returned ${res.status}` };
     const body = await res.json().catch(() => ({}));
-    return { ok: true, reason: body.reason || action, sessionId: reg.sessionId || null };
+    return { ok: true, reason: body.reason || action, sessionId: reg.sessionId || null, ...body };
   } catch (err) {
     // Endpoint unreachable → stale registry (server already gone). Clean it up.
     clearControlRegistry();

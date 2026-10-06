@@ -48,6 +48,15 @@ export function createMemoryFs(opts = {}) {
       files.set(b, files.get(a));
       files.delete(a);
     },
+    async unlink(file) {
+      const p = norm(file);
+      if (!files.has(p)) {
+        const e = new Error(`ENOENT: no such file ${p}`);
+        e.code = 'ENOENT';
+        throw e;
+      }
+      files.delete(p);
+    },
     async readdir(dir) {
       const d = norm(dir).replace(/\/$/, '') + '/';
       const names = new Set();

@@ -2,6 +2,7 @@
 
 Working branch: `session-reliability`. Baseline reviewed: `a753847`.
 Baseline test suite: 13/13 passing on Node 24 / Windows 11 (this machine).
+Current test suite: 82/82 passing on Node 24 / Windows 11 (through Phase 4).
 
 This document tracks what is **done + verified**, **done but unverified**, and
 **deferred**, so the work can be resumed. Keep it honest: a fake-backend test
@@ -179,7 +180,59 @@ reducing frames is what actually sheds bytes once thumbnails hit the floor.
 
 ## Phase 4 — replay buffering + markers
 
-Status: not started.
+Status: **complete** — a rolling instant-replay buffer, repeatable markers that
+pin a window into a clip, per-clip finalisation, the control-page Mark button +
+`/mark` endpoint + `marey mark`, and a new `replay` MCP tool landed and verified
+(82 tests passing across all suites; real Windows arm→mark×2→finish→two clips
+smoke-tested, with eviction proven on real pixels).
+
+The problem Phase 4 solves: for an intermittent or unpredictable glitch, the
+user cannot start a recording *before* it happens — by the time they react it is
+over. Replay keeps the last few seconds always buffered so the moment that just
+happened can be captured after the fact (dashcam / instant-replay model,
+user-chosen over the alternatives).
+
+| Component | What it does | State |
+| --- | --- | --- |
+| Rolling ring buffer (`_evictAged` in `src/session.mjs`) | A replay session keeps only the last `replayWindowMs` of frames; as each new frame lands, older **unpinned** frames are deleted from disk and their bytes reclaimed, so an arbitrarily long armed session stays bounded by (window × fps × frame size). A monotonic `frameSeq` means evicting (splicing the frame array) never reuses a frame index/filename. An in-flight write that is evicted before it lands is deleted once it completes (no untracked leak). | ✅ Done + verified (unit + Windows) |
+| Markers → clips (`mark` in `src/session.mjs`) | A marker snapshots the frames currently in the look-back window and **pins** them so eviction cannot delete them. Repeatable — each mark yields its own clip. Empty-buffer and clip-cap cases are no-ops warned once. | ✅ Done + verified (unit + Windows) |
+| Per-clip finalisation (`_composeClips` / `_selectAndCompose`) | On stop, one budget-fitted contact sheet is composed per clip, sharing the Phase-3 selection + byte/pixel budget core. The global output-byte budget is divided across the clips shown (`maxClips` cap). Zero markers → the surviving window becomes one implicit clip (so Finish without a mark still returns the most recent motion). The first clip is mirrored into the top-level `contactSheet` so non-replay-aware consumers still work. | ✅ Done + verified (unit + Windows) |
+| Control Mark button + `/mark` (`src/control.mjs`) | The control page shows a repeatable **Mark** button (M / Space) and a live marker count when marking is enabled; `/mark` is token-guarded in a custom header (CSRF-safe) exactly like finish/cancel, but **does not settle the outcome** — recording continues. `signalControl('mark')` lets `marey mark` pin a clip from another process; a 404 (observe session) maps to a friendly "not a replay session" message. | ✅ Done + verified (unit + real) |
+| `replay` MCP tool + `recorder.replay` + `marey replay`/`marey mark` | A new, non-synonymous tool: arms the ring buffer, opens a Mark+Finish control page, blocks like `observe`, and returns one contact-sheet image per clip. The CLI gains `replay` (`--window-seconds`) and `mark`. Baseline tools and the `npx -y @anilyesilkaya/marey` install path are unchanged. | ✅ Done + verified (integration + real Windows) |
+
+New limits in `DEFAULT_LIMITS`: `replayWindowMs` (20 s default look-back),
+`maxReplayWindowMs` (120 s), `maxReplaySessionMs` (30 min armed-session safety
+deadline), `maxClips` (12 markers retained/shown). The finalised result reports
+`replay`, `evictedFrames`, `markCount`, and a `clips[]` array (each with its own
+`contactSheet`, `frameCount`, `windowMs`, and full-resolution frame paths).
+
+Verification:
+- 5 new session tests (`test/session.test.mjs`) on the fake clock/backend/fs:
+  the ring buffer bounds retained frames **and** on-disk files to the window
+  while reporting substantial eviction; a marker's window survives later
+  eviction (pinned files remain on disk); multiple markers yield distinct clips
+  with distinct sheet files; no-marker finish returns the window as one implicit
+  clip (warned); the per-clip byte budget is honoured for each clip.
+- 6 new replay integration tests (`test/replay.test.mjs`) on real timers with a
+  fake backend + in-memory fs: the Mark button/`/mark` exist only when marking
+  is enabled (observe is unchanged, `/mark` → 404); `/mark` rejects a tokenless
+  request (CSRF) and never runs `onMark`; a mark does **not** settle the
+  outcome; the full arm→mark×2→finish→two-clips round-trip; cross-process
+  `marey mark` via `signalControl`; and `mark` on a non-replay observation
+  reports cleanly.
+- `test/transport.test.mjs` now also asserts `observe` and `replay` are exposed
+  by `tools/list` (the 6 baseline tools remain registered).
+- **Real Windows end-to-end**: `marey replay --no-open --fps 4 --window-seconds 3`
+  in one process + `marey mark` (×2, spaced ~2.5 s apart) + `marey finish` in
+  another produced **two clips of 13 frames each**, composed to two decodable
+  1976×1344 PNG sheets (746 KB / 681 KB). The ring buffer evicted the aged
+  frames: of 78 frames captured over ~7 s, only indices **49–78** remained on
+  disk (the earlier 48 were deleted), and the monotonic index proves no filename
+  was reused across eviction. `completionReason: finished`, manifest written.
+
+Not changed: markers do not settle the outcome (only Finish/Cancel do), so
+replay stays a single pending request like observe; the degradation order and
+selection logic are inherited unchanged from Phase 3.
 
 ## Phase 5 — temporal fidelity + agent-driven capture
 

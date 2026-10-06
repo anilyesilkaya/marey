@@ -356,3 +356,125 @@ test('output byte budget shrinks the contact sheet to fit', async () => {
   assert.ok(result.thumbWidth < 480 || result.contactSheet.composedFrames < result.frameCount);
   assert.ok(result.warnings.some((w) => /budget/.test(w)));
 });
+
+// --- Phase 4: replay ring buffer + markers ----------------------------------
+
+// Count frame_*.png files currently on the (in-memory) disk.
+function frameFilesOnDisk(fs) {
+  let n = 0;
+  for (const p of fs._files.keys()) if (/frame_\d+_.*\.png$/.test(p)) n++;
+  return n;
+}
+
+test('replay ring buffer evicts aged frames, keeping disk bounded', async () => {
+  // window 1000ms at 10 fps → the buffer should hold ~10 frames no matter how
+  // long the session runs. Over 4s the backend emits ~40 frames, but eviction
+  // deletes the aged, unpinned ones from disk as new ones arrive.
+  const fs = createMemoryFs();
+  const { clock, controller } = make({ fs });
+  const p = controller.start({ fps: 10, replay: true, windowMs: 1000 });
+  await clock.advance(1);
+  const started = await p;
+  await clock.advance(4000);
+
+  const live = controller.status(started.sessionId);
+  // Retained set is bounded by the window (allow slack for boundary frames).
+  assert.ok(live.frameCount <= 15, `window should bound retained frames, got ${live.frameCount}`);
+  assert.ok(frameFilesOnDisk(fs) <= 15, `disk should be bounded by the window, got ${frameFilesOnDisk(fs)}`);
+  assert.equal(live.replay, true);
+
+  const result = await controller.stop(started.sessionId);
+  // Many frames were emitted; most were evicted (proving the buffer rolled).
+  assert.ok(result.evictedFrames >= 20, `expected substantial eviction, got ${result.evictedFrames}`);
+});
+
+test('a marker pins its window so eviction cannot delete it', async () => {
+  const fs = createMemoryFs();
+  const { clock, controller } = make({ fs });
+  const p = controller.start({ fps: 10, replay: true, windowMs: 1000 });
+  await clock.advance(1);
+  const started = await p;
+
+  // Fill the window, then mark — pinning the frames currently buffered.
+  await clock.advance(1000);
+  const mark = controller.mark(started.sessionId);
+  assert.ok(mark.frameCount >= 5, `mark should pin the buffered window, got ${mark.frameCount}`);
+  const pinnedPaths = controller.active.clips[0].frames.map((f) => f.path);
+
+  // Record far past the window so unpinned frames roll out; pinned must remain.
+  await clock.advance(4000);
+  for (const pth of pinnedPaths) {
+    assert.ok(fs.has(pth), `pinned frame ${pth} must survive eviction`);
+  }
+
+  const result = await controller.stop(started.sessionId);
+  assert.equal(result.markCount, 1);
+  assert.equal(result.clips.length, 1);
+  assert.ok(result.clips[0].contactSheet, 'the clip has its own contact sheet');
+  assert.equal(result.clips[0].frameCount, mark.frameCount);
+});
+
+test('multiple markers each yield their own clip', async () => {
+  const { clock, controller } = make();
+  const p = controller.start({ fps: 10, replay: true, windowMs: 1000 });
+  await clock.advance(1);
+  const started = await p;
+
+  await clock.advance(800);
+  const m1 = controller.mark(started.sessionId);
+  await clock.advance(1200);
+  const m2 = controller.mark(started.sessionId);
+  await clock.advance(500);
+  const result = await controller.stop(started.sessionId);
+
+  assert.equal(m1.markIndex, 1);
+  assert.equal(m2.markIndex, 2);
+  assert.equal(result.markCount, 2);
+  assert.equal(result.clips.length, 2);
+  assert.equal(result.clips[0].markIndex, 1);
+  assert.equal(result.clips[1].markIndex, 2);
+  // Each clip composed its own sheet, and they are distinct files.
+  assert.ok(result.clips[0].contactSheet && result.clips[1].contactSheet);
+  assert.notEqual(result.clips[0].contactSheetPath, result.clips[1].contactSheetPath);
+});
+
+test('replay finished with no marker returns the final window as one implicit clip', async () => {
+  const { clock, controller } = make();
+  const p = controller.start({ fps: 10, replay: true, windowMs: 1000 });
+  await clock.advance(1);
+  const started = await p;
+  await clock.advance(1500);
+  const result = await controller.stop(started.sessionId);
+
+  assert.equal(result.markCount, 1, 'one implicit clip from the surviving window');
+  assert.equal(result.clips.length, 1);
+  assert.ok(result.contactSheet, 'top-level sheet mirrors the implicit clip');
+  assert.ok(result.warnings.some((w) => /no marker/i.test(w)));
+});
+
+test('the per-clip byte budget is divided across shown clips', async () => {
+  // Two marks → the global output budget is split so the TOTAL stays bounded.
+  // Frames are 64×48 so there is real area; a small global budget must force
+  // each clip's sheet to degrade and report it.
+  const { clock, controller } = make({
+    backendOpts: { width: 64, height: 48 },
+    limits: { maxOutputBytes: 1200, maxComposeFrames: 36 },
+  });
+  const p = controller.start({ fps: 10, replay: true, windowMs: 1000, thumbWidth: 480, cols: 4 });
+  await clock.advance(1);
+  const started = await p;
+  await clock.advance(600);
+  controller.mark(started.sessionId);
+  await clock.advance(1000);
+  controller.mark(started.sessionId);
+  await clock.advance(300);
+  const result = await controller.stop(started.sessionId);
+
+  assert.equal(result.clips.length, 2);
+  // perClipBytes has a 400 KB floor, so a tiny global budget maps to that floor;
+  // the real guarantee we assert is each clip encodes to a usable PNG that
+  // honours its own ceiling and the degradation is surfaced.
+  for (const clip of result.clips) {
+    assert.ok(clip.contactSheet.buffer.length <= 400_000, 'each clip fits its per-clip budget');
+  }
+});

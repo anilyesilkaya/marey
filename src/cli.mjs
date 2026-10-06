@@ -3,17 +3,19 @@
 //
 //   node src/cli.mjs record    --seconds 5 --fps 2 --region primary --detail high
 //   node src/cli.mjs observe   --fps 3 --detail high   (opens a control page; Finish to end)
+//   node src/cli.mjs replay    --window-seconds 20 --fps 3   (rolling buffer; Mark to clip)
 //   node src/cli.mjs session   --for 8 --fps 4 --detail high   (Ctrl+C stops early)
 //   node src/cli.mjs capture   --region window --title "Visual Studio"
 //   node src/cli.mjs get-frame --dir captures/20260101-120000 --index 4
 //   node src/cli.mjs get-frame --dir ... --index 4 --normalized --crop-x 0.5 --crop-w 0.5  (zoom)
+//   node src/cli.mjs mark      (pin the current replay window into a clip)
 //   node src/cli.mjs finish    (end the active observation; alias: stop)
 //   node src/cli.mjs windows
 //   node src/cli.mjs backend
 //   node src/cli.mjs doctor    (diagnose capture capability on this machine)
 
 import os from 'node:os';
-import { record, capture, getFrame, startRecording, stopRecording, observe } from './recorder.mjs';
+import { record, capture, getFrame, startRecording, stopRecording, observe, replay } from './recorder.mjs';
 import { listWindows, detectBackend, captureCapabilities, captureFrame } from './capture.mjs';
 import { signalControl, readControlRegistry } from './control.mjs';
 
@@ -133,6 +135,44 @@ async function main() {
       console.log(`Frames dir:    ${result.dir}`);
       break;
     }
+    case 'replay': {
+      // Rolling instant-replay buffer: keep only the last --window-seconds of
+      // frames; Mark (button, M/Space, or `marey mark`) pins the current window
+      // into a clip. Finish/Cancel ends it and composes one sheet per clip.
+      const open = args['no-open'] ? false : !isFalsey(args.open);
+      console.log('Starting replay — reproduce the issue, then click Mark (or run `marey mark`) to save the moment. Finish when done.');
+      const result = await replay({
+        ...args,
+        windowSeconds: args['window-seconds'],
+        open,
+        onUrl: (url, opened) => {
+          console.log(opened ? `Control page opened: ${url}` : `Open this URL to mark/finish: ${url}`);
+        },
+      });
+      const how = result.observation === 'cancelled' ? 'cancelled'
+        : result.observation === 'timed-out' ? 'timed out' : 'finished';
+      const clips = result.clips || [];
+      console.log(`Replay ${how}: ${clips.length} clip${clips.length === 1 ? '' : 's'} from ${result.frameCount} buffered frames.`);
+      clips.forEach((c, i) => {
+        console.log(`  Clip ${i + 1} (marker #${c.markIndex}): ${c.frameCount} frames → ${c.contactSheetPath}`);
+      });
+      console.log(`Frames dir: ${result.dir}`);
+      break;
+    }
+    case 'mark': {
+      // Pin the current replay window into a clip, from any terminal. Leaves the
+      // recording running (unlike finish/stop).
+      const r = await signalControl('mark');
+      if (r.ok) {
+        console.log(r.frameCount
+          ? `Marked clip #${r.markIndex} (${r.frameCount} frames).`
+          : `Mark registered${r.note ? ` (${r.note})` : ''}.`);
+      } else {
+        console.log(r.error);
+        process.exit(1);
+      }
+      break;
+    }
     case 'finish':
     case 'stop': {
       // Signal the active observation (running in the MCP server or a separate
@@ -168,7 +208,7 @@ async function main() {
       break;
     }
     default:
-      console.log('Usage: marey <record|observe|session|capture|get-frame|finish|windows|backend|doctor> [--flags]');
+      console.log('Usage: marey <record|observe|replay|session|capture|get-frame|mark|finish|windows|backend|doctor> [--flags]');
       process.exit(command ? 1 : 0);
   }
 }
