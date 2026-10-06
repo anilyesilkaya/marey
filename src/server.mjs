@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { StdioServer } from './jsonrpc.mjs';
-import { record, capture, getFrame, startRecording, stopRecording, recordingStatus, observe } from './recorder.mjs';
+import { record, capture, getFrame, startRecording, stopRecording, recordingStatus, observe, replay } from './recorder.mjs';
 import { listWindows, detectBackend } from './capture.mjs';
 import { TargetUnavailableError } from './capture.mjs';
 
@@ -123,6 +123,34 @@ const TOOLS = [
     },
   },
   {
+    name: 'replay',
+    description:
+      'Watch the USER with an instant-replay buffer, hands-free. Like observe, ' +
+      'but instead of recording the whole session it keeps only the last few ' +
+      'seconds in a rolling buffer; whenever the user clicks MARK (or runs ' +
+      '`marey mark`) the moment that just happened is saved as a clip. Use this ' +
+      'for "it just glitched — did you see that?": the bug is unpredictable or ' +
+      'intermittent, so the user cannot start a recording before it happens. ' +
+      'You call replay, tell the user to click Mark right after each glitch and ' +
+      'Finish when done, and you receive one contact sheet per marked moment. ' +
+      'Multiple marks return multiple clips. A max-duration safety limit always ' +
+      'returns. If no browser can open, the control URL is printed to the server ' +
+      'log and the user can mark/finish with `marey mark` / `marey finish`.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fps: { type: 'number', description: 'Frames captured per second (default 2). The rolling buffer holds windowSeconds × fps frames.' },
+        windowSeconds: { type: 'number', description: 'Look-back window kept in the rolling buffer, in seconds (default 20, max 120). Each Mark saves the frames from the last this-many seconds.' },
+        region: { type: 'string', enum: ['primary', 'virtual', 'window'], description: 'Capture region (default primary).' },
+        title: { type: 'string', description: 'Window-title substring to match when region is "window".' },
+        maxSeconds: { type: 'number', description: 'Safety cap: auto-finish after this many seconds if the user never clicks Finish (default 600, max 1800).' },
+        detail: { type: 'string', enum: ['overview', 'high', 'max'], description: 'Contact-sheet legibility preset (default "overview"). See record.' },
+        cols: { type: 'number', description: 'Thumbnails per contact-sheet row. Overrides the detail preset.' },
+        thumbWidth: { type: 'number', description: 'Thumbnail width in pixels. Overrides the detail preset.' },
+      },
+    },
+  },
+  {
     name: 'list_windows',
     description:
       'List visible windows (title, process, and geometry where available) so ' +
@@ -214,6 +242,8 @@ server.method('tools/call', async (params) => {
         return handleStopRecording();
       case 'observe':
         return handleObserve(args);
+      case 'replay':
+        return handleReplay(args);
       case 'capture':
         return handleCapture(args);
       case 'list_windows':
@@ -278,6 +308,60 @@ async function handleObserve(args) {
     : result.observation === 'timed-out' ? 'Observation hit its time limit; captured'
     : 'Observation finished by the user; captured';
   return contactSheetResult(result, how);
+}
+
+async function handleReplay(args) {
+  const result = await replay({
+    ...args,
+    onUrl: (url, opened) => {
+      server.log(`[marey] replay control page: ${url}` +
+        (opened ? ' (opened in your browser)' : ' (open this URL, or run `marey mark` / `marey finish`)'));
+    },
+  });
+  return replayResult(result);
+}
+
+// Formatter for a replay result: one contact-sheet image per marked clip,
+// followed by a summary that locates every clip's frames for get_frame. Falls
+// back to the single-sheet formatter if (somehow) there are no clips.
+function replayResult(result) {
+  const clips = result.clips || [];
+  if (clips.length === 0) return contactSheetResult(result, 'Replay captured');
+
+  const how =
+    result.observation === 'cancelled' ? 'Replay cancelled by the user'
+    : result.observation === 'timed-out' ? 'Replay hit its time limit'
+    : 'Replay finished by the user';
+
+  const content = [];
+  const sections = [];
+  clips.forEach((clip, i) => {
+    content.push(imageContent(clip.contactSheet.buffer));
+    const frameList = clip.frames
+      .map((f) => `    #${String(f.index).padStart(3, '0')}  ${(f.timeMs / 1000).toFixed(2)}s  ${f.path}`)
+      .join('\n');
+    sections.push(
+      `Clip ${i + 1} of ${clips.length} (marker #${clip.markIndex}) — ` +
+      `${clip.frameCount} frames over the ${(clip.windowMs / 1000).toFixed(0)}s before the mark, ` +
+      `shown ${clip.contactSheet.composedFrames}.\n` +
+      `  Contact sheet: ${clip.contactSheet.width}×${clip.contactSheet.height}px → ${clip.contactSheetPath}\n` +
+      `  Full-resolution frames (get_frame with this dir + the frame number):\n${frameList}`,
+    );
+  });
+
+  const summary =
+    `${how}: ${clips.length} clip${clips.length === 1 ? '' : 's'} from ` +
+    `${result.frameCount} buffered frames (${result.region}` +
+    `${result.title ? ` · "${result.title}"` : ''}, ${result.fps} fps).\n` +
+    (result.evictedFrames ? `${result.evictedFrames} older frames were evicted from the rolling buffer.\n` : '') +
+    `Detail: ${result.detail} (${result.cols} cols @ ${result.thumbWidth}px). ` +
+    `One contact sheet per marked moment is shown above, in order.\n` +
+    `\nIf fine detail is not legible, call get_frame to fetch a specific frame at ` +
+    `full resolution (dir below + the frame number), or re-run with detail:"high"/"max".\n` +
+    `\nRecording dir: ${result.dir}\n\n${sections.join('\n\n')}`;
+
+  content.push({ type: 'text', text: summary });
+  return { content };
 }
 
 // Shared formatter for record / stop_recording: a contact-sheet image plus a
