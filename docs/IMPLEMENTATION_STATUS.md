@@ -46,7 +46,7 @@ controller, so the existing MCP tools and CLI keep their signatures.
 | Concurrent starts bypass guard | Ownership acquired atomically pre-await | ✅ Done + verified (unit) |
 | Session dirs collide (per-second) | Unique id + dir | ✅ Done + verified (unit + Windows smoke) |
 | Memory grows with decoded frames | Bound by bytes; keep encoded frames | ✅ Done + verified (unit) |
-| Window capture broadens silently | Honour target or explicit unsupported | ⚠️ Done (Windows backend); window path not smoke-tested yet |
+| Window capture broadens silently | Honour target or explicit unsupported | ✅ Done + verified on Windows (PrintWindow, occlusion-proof; minimized/cloaked rejected loudly) |
 | Failures suppressed | Preserve/report failures; terminate persistent failure | ✅ Done + verified (unit) |
 | Transport validation incomplete | Invalid input cannot crash; tool errors actionable | ✅ Done + verified (unit + e2e) |
 
@@ -82,8 +82,32 @@ clean exit, parse errors as `-32700` with null id, batch/shape/param validation.
 `src/server.mjs` wraps tool execution so expected failures become `isError:true`
 results while malformed protocol input stays a JSON-RPC error.
 
-Not yet verified: Linux/macOS native capture (no host here); window-region
-capture on any OS (the Windows window path is implemented but not smoke-tested).
+Window capture (Windows) — reworked and smoke-tested (2026-10-07): the Windows
+backend now grabs a window with **PrintWindow + PW_RENDERFULLCONTENT** (the
+window renders its own surface into an off-screen 24bpp RGB bitmap) instead of
+`CopyFromScreen` over the window's screen rectangle. This makes it occlusion-
+proof and correct for DWM/GPU-composited apps, and the 24bpp target avoids the
+zero-alpha all-transparent-PNG trap. Minimized (`IsIconic`) and cloaked
+(`DWMWA_CLOAKED` — other virtual desktop / suspended UWP) windows have no
+renderable surface, so both the single-grab and streaming paths now reject them
+with a `TargetUnavailableError` ("…is minimized or hidden; restore it on screen
+to capture it") instead of silently returning a tiny garbage frame. `marey
+windows` / `list_windows` flag such windows as `hidden`.
+
+Verified on real pixels (this machine): (1) a visible window captured at its true
+`1278×750` bounds (not the full `1536×960` screen), decoded to 100% non-black
+content; (2) **occlusion probe** — with a bright-red TOPMOST window placed exactly
+over the target, old `CopyFromScreen` captured 100% red (the cover) while
+PrintWindow captured 0% red (the target's own surface, decode-verified visually);
+(3) a minimized window produced a loud `TargetUnavailableError` (exit 1), where it
+previously returned a silent `159×27` frame; (4) a 3 s / 3 fps streaming window
+recording produced 10 frames, all `1278×750` and 100% non-black, composed to a
+clean per-window contact sheet. 82/82 tests still pass.
+
+Not yet verified: Linux/macOS native capture (no host here); the Linux window
+path (ffmpeg + xdotool geometry) is implemented but not smoke-tested, and remains
+a screen-rectangle crop rather than an occlusion-proof surface grab; macOS window
+capture is still explicitly unsupported (display-only `screencapture`).
 
 ## Phase 2 — local controls + observation workflow
 
