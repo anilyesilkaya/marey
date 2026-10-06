@@ -130,7 +130,52 @@ would pop a browser window on the host.
 
 ## Phase 3 — compact visual evidence
 
-Status: not started.
+Status: **complete** — content-aware frame selection, an enforced output
+byte/pixel budget, and progressive inspection (crop) on `get_frame` landed and
+verified (71 tests passing across all suites; real Windows capture → selection,
+budget, and crop all exercised on actual screen pixels).
+
+The problem Phase 3 solves: a contact sheet is only useful if the client can
+actually display it and if its cells land on the moments that matter. Three
+changes address that.
+
+| Component | What it does | State |
+| --- | --- | --- |
+| Content-aware selection (`selectByChange` in `src/session.mjs`) | When a recording has more frames than the cell cap, cells are spent on the frames with the most visual **change** from their predecessor (via a cheap 32px grayscale signature + mean-abs diff), always keeping first + last and temporal order. Falls back to even sampling when nothing changes. All frames stay on disk. | ✅ Done + verified (unit + Windows) |
+| Output budget (`composeWithinBudget` in `src/contactsheet.mjs`) | A composed sheet must fit the client's inline-image cap or it is dropped. The sheet is degraded to fit two ceilings — output **pixels** (exact layout math) and encoded **bytes** (measured by a real encode) — shrinking thumbnail width first, then dropping frames once at the floor. Encoder is injected so the fit loop is pure/testable. | ✅ Done + verified (unit + Windows) |
+| Progressive inspection (`crop` on `get_frame`) | An agent can zoom into part of a frame at FULL resolution without transferring the whole image, using a normalized (0..1 fractions) or pixel sub-rectangle. Out-of-bounds rects are clipped. No crop → original bytes returned untouched (byte-identical). Wired through `recorder.getFrame`, the MCP `get_frame` tool, and the CLI `get-frame` (`--normalized --crop-x/-y/-w/-h`). | ✅ Done + verified (unit + Windows) |
+
+New image primitives (`src/image.mjs`): `crop` (contiguous-row copy, clipped),
+`grayscaleSignature` (tiny luma fingerprint for change detection),
+`signatureDiff` (mean absolute difference). New limits in `DEFAULT_LIMITS`:
+`maxAnalysisFrames` (240, bounds the decode pass used to choose cells),
+`maxOutputBytes` (3.5 MB ≈ 4.8 MB base64, under the ~5 MB inline-image limit
+most MCP clients enforce). The finalised result now reports `composedFrames` and
+`composedIndices` (which frames are actually on the sheet) and the *applied*
+`cols`/`thumbWidth` after budget fitting.
+
+Verification:
+- 11 new core tests (`test/core.test.mjs`): `crop` exact sub-rectangle +
+  out-of-bounds clipping; `getFrame` normalized crop, pixel crop with clipping,
+  and byte-identical uncropped fetch; `selectByChange` picks high-change interior
+  frames and keeps first/last, and falls back to even sampling with no change
+  signal; signature detects change / ignores identity; `composeWithinBudget`
+  shrinks thumbnails before dropping frames, drops frames once at the floor, and
+  honours the pixel budget (all via an injected encoder for determinism).
+- 2 new session integration tests (`test/session.test.mjs`) on the fake
+  clock/backend: a 12-frame recording with scripted change selects exactly the
+  flash (#6) and change (#9) frames over an even sample's (#4,#8); a tiny byte
+  budget degrades the sheet and reports it.
+- **Real Windows end-to-end**: `record --seconds 8 --fps 6` captured 48 real
+  2560×1440 frames; selection chose 36 of 48 concentrated on the active period
+  (frames 1–31) and sparse across the settled tail (34,37,41,45,48), first/last
+  anchored, encoded sheet 717 KB (well under the 3.5 MB budget). A normalized
+  `get_frame` crop of a real frame returned a valid 512×288 PNG (20% region of a
+  2560×1440 source), decode-verified.
+
+Not changed: the degradation order (thumbWidth → frame count) reflects that cols
+barely affect byte size (total thumbnail area is independent of column count);
+reducing frames is what actually sheds bytes once thumbnails hit the floor.
 
 ## Phase 4 — replay buffering + markers
 

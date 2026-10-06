@@ -51,6 +51,47 @@ export function resize(img, targetWidth, targetHeight) {
   return { width: targetWidth, height: targetHeight, data: dst };
 }
 
+// Extract a sub-rectangle at full resolution. Clips the rectangle to the source
+// bounds (never reads out of range) and copies each row in one shot, since a
+// crop row is contiguous in the source buffer. Returns a fresh RGBA image.
+export function crop(img, x, y, w, h) {
+  const { width: sw, height: sh, data: src } = img;
+  const cx = Math.max(0, Math.min(x | 0, sw - 1));
+  const cy = Math.max(0, Math.min(y | 0, sh - 1));
+  const cw = Math.max(1, Math.min(w | 0, sw - cx));
+  const ch = Math.max(1, Math.min(h | 0, sh - cy));
+  const out = Buffer.allocUnsafe(cw * ch * 4);
+  for (let row = 0; row < ch; row++) {
+    const srcStart = ((cy + row) * sw + cx) * 4;
+    src.copy(out, row * cw * 4, srcStart, srcStart + cw * 4);
+  }
+  return { width: cw, height: ch, data: out };
+}
+
+// Downscale to a tiny grayscale signature for cheap frame-to-frame change
+// detection. Returns a Uint8Array of length sigW*sigH (row-major Rec.601 luma,
+// 0..255). Aspect is preserved so motion is weighted uniformly across the frame.
+export function grayscaleSignature(img, sigW = 32) {
+  const sigH = Math.max(1, Math.round(sigW * (img.height / img.width)));
+  const small = resize(img, sigW, sigH);
+  const out = new Uint8Array(sigW * sigH);
+  const { data } = small;
+  for (let i = 0; i < out.length; i++) {
+    const p = i * 4;
+    out[i] = (data[p] * 0.299 + data[p + 1] * 0.587 + data[p + 2] * 0.114) | 0;
+  }
+  return out;
+}
+
+// Mean absolute per-pixel difference between two equal-length signatures (0..255).
+// 0 = identical; larger = more visual change. Mismatched lengths score 0.
+export function signatureDiff(a, b) {
+  if (!a || !b || a.length !== b.length) return 0;
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) sum += Math.abs(a[i] - b[i]);
+  return sum / a.length;
+}
+
 // Copy `src` onto `dst` at (ox, oy). Source is drawn opaque (no alpha blend);
 // pixels outside the destination are clipped.
 export function blit(dst, src, ox, oy) {

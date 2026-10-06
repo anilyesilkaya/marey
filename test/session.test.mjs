@@ -293,3 +293,66 @@ test('record() convenience returns a completed result at the deadline', async ()
   assert.ok(result.frameCount >= 1);
   assert.equal(result.requested.seconds, 1);
 });
+
+// --- Phase 3: content-aware selection through the full compose path ---------
+
+test('contact sheet selects high-change frames when there are more than the cell cap', async () => {
+  // 12 frames, but only a few moments actually change: frames 1 (first), 6, 9,
+  // and 12 (last) differ sharply; the rest repeat their predecessor's colour.
+  // With a 4-cell cap, selection should land on exactly those moments rather
+  // than sampling evenly by time (which would pick 1, 4, 8, 12).
+  const black = [10, 10, 10, 255];
+  const flash = [240, 240, 240, 255];
+  const mid = [120, 60, 180, 255];
+  const fills = [
+    black, black, black, black, black, // 1-5: static
+    flash,                             // 6: big change ↑
+    flash, flash,                      // 7-8: static (now bright)
+    mid,                               // 9: big change ↓
+    mid, mid,                          // 10-11: static
+    black,                             // 12: big change (last, kept anyway)
+  ];
+  const { clock, controller } = make({
+    backendOpts: { fills, width: 32, height: 24 },
+    limits: { maxComposeFrames: 4 },
+  });
+  const p = controller.start({ fps: 10 });
+  await clock.advance(1);
+  const started = await p;
+  // Frames tick at t=0,100,...,1100 → 12 frames; then stop and finalise.
+  await clock.advance(1100);
+  const result = await controller.stop(started.sessionId);
+
+  assert.ok(result.frameCount >= 12, `expected ≥12 frames, got ${result.frameCount}`);
+  const shown = result.contactSheet.composedIndices;
+  assert.equal(shown.length, 4, 'sheet shows exactly the cell cap');
+  assert.equal(shown[0], 1, 'first frame kept');
+  assert.equal(shown[shown.length - 1], result.frameCount, 'last frame kept');
+  // The two interior transitions (frames 6 and 9) must be chosen over the
+  // static frames an even sample (4, 8) would have taken.
+  assert.ok(shown.includes(6), `expected the flash frame #6 in ${shown}`);
+  assert.ok(shown.includes(9), `expected the change frame #9 in ${shown}`);
+  assert.ok(result.warnings.some((w) => /selected by visual change/.test(w)));
+});
+
+test('output byte budget shrinks the contact sheet to fit', async () => {
+  // A tiny byte budget forces the budget loop to degrade the layout. Frames are
+  // 64×48 so there is real area to shed. We assert the encoded sheet honours the
+  // cap and that the degradation is reported.
+  const { clock, controller } = make({
+    backendOpts: { width: 64, height: 48 },
+    limits: { maxOutputBytes: 1500, maxComposeFrames: 36 },
+  });
+  const p = controller.start({ fps: 10, thumbWidth: 480, cols: 4 });
+  await clock.advance(1);
+  const started = await p;
+  await clock.advance(1000);
+  const result = await controller.stop(started.sessionId);
+
+  assert.ok(result.contactSheet.buffer.length <= 1500,
+    `sheet ${result.contactSheet.buffer.length}B must fit the 1500B budget`);
+  // Degradation happened: either thumbnails shrank below the requested 480px or
+  // frames were dropped from the sheet — and it was reported.
+  assert.ok(result.thumbWidth < 480 || result.contactSheet.composedFrames < result.frameCount);
+  assert.ok(result.warnings.some((w) => /budget/.test(w)));
+});

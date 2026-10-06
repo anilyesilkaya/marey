@@ -29,7 +29,8 @@ import path from 'node:path';
 import { createRealClock } from './clock.mjs';
 import { createDefaultBackend, pngDimensions } from './capture.mjs';
 import { decodePng, encodePng } from './png.mjs';
-import { composeContactSheet } from './contactsheet.mjs';
+import { composeWithinBudget } from './contactsheet.mjs';
+import { grayscaleSignature, signatureDiff } from './image.mjs';
 
 export const MANIFEST_VERSION = 1;
 
@@ -42,7 +43,10 @@ export const DEFAULT_LIMITS = {
   maxDiskBytes: 2 * 1024 ** 3,// cap on total bytes written for a session (2 GiB)
   maxInputPixels: 8192 * 8192,// reject an absurdly large source frame
   maxComposeFrames: 36,       // cap on cells composed into one contact sheet
+  maxAnalysisFrames: 240,     // cap on frames DECODED to choose cells (bounds cost)
   maxOutputPixels: 24_000_000,// cap on the composed contact-sheet pixel count
+  maxOutputBytes: 3_500_000,  // cap on encoded sheet bytes (≈4.8 MB base64, under
+                              // the ~5 MB inline-image limit most MCP clients enforce)
   shutdownTimeoutMs: 5_000,   // max wait for the capture worker to stop
 };
 
@@ -505,50 +509,106 @@ export class SessionController {
     return session.finalisePromise;
   }
 
-  // Decode the selected frames from disk and compose the contact sheet. Bounds
-  // the composed cell count and output pixels so a long session cannot allocate
-  // a giant image (Phase 3 replaces this with content-aware selection).
+  // Choose which frames to show, decode them, and compose a contact sheet that
+  // fits the output budget. Three Phase-3 concerns, in order:
+  //
+  //   1. SELECTION — when there are more frames than cells, pick the most
+  //      informative ones by visual change (see selectByChange) rather than
+  //      sampling blindly by time, so the sheet lands on the moments that
+  //      actually changed. All frames stay on disk for get_frame.
+  //   2. BUDGET — a returned image has a hard size ceiling in most MCP clients;
+  //      composeWithinBudget degrades the layout (thumbWidth, then frame count)
+  //      until the encoded sheet fits both a pixel and a byte budget.
+  //   3. The composed cell count and analysis cost are both bounded so a long
+  //      session cannot allocate a giant image or decode unbounded frames.
   async _composeFromDisk(session, committed) {
-    let selected = committed;
-    let warning = null;
     const maxCells = this.limits.maxComposeFrames;
+
+    // --- 1. selection -------------------------------------------------------
+    let selected = committed;
+    let selectionNote = null;
     if (committed.length > maxCells) {
-      selected = evenSample(committed, maxCells);
-      warning = `Contact sheet shows ${selected.length} of ${committed.length} frames (evenly sampled); all frames remain on disk.`;
+      // Decode a bounded candidate pool to measure frame-to-frame change, then
+      // choose the most informative cells. Pixels are discarded after the tiny
+      // signatures (bounded memory); selected frames are re-read below. This
+      // extra decode pass is only paid when a selection is actually needed.
+      const pool = committed.length > this.limits.maxAnalysisFrames
+        ? evenSample(committed, this.limits.maxAnalysisFrames)
+        : committed;
+      const { entries, sigs } = await this._signaturesFor(pool);
+      selected = entries.length > maxCells ? selectByChange(entries, sigs, maxCells) : entries;
+      selectionNote =
+        `Contact sheet shows ${selected.length} of ${committed.length} frames ` +
+        `(selected by visual change); all frames remain on disk (use get_frame).`;
     }
 
-    // Clamp thumbWidth so the composed sheet stays within the output-pixel budget.
-    const first = decodePng(await this.fs.readFile(selected[0].path));
-    const aspect = first.height / first.width;
-    const rows = Math.ceil(selected.length / session.cols);
-    let thumbWidth = session.thumbWidth;
-    const outPixels = () => {
-      const w = session.cols * thumbWidth;
-      const h = rows * (thumbWidth * aspect + 24);
-      return w * h;
-    };
-    while (thumbWidth > 96 && outPixels() > this.limits.maxOutputPixels) {
-      thumbWidth = Math.round(thumbWidth * 0.85);
-    }
-
+    // --- 2. decode the selected frames for composition ----------------------
     const frames = [];
-    frames.push({ image: first, index: selected[0].index, timeMs: selected[0].timeMs });
-    for (let i = 1; i < selected.length; i++) {
-      const img = decodePng(await this.fs.readFile(selected[i].path));
-      frames.push({ image: img, index: selected[i].index, timeMs: selected[i].timeMs });
+    for (const entry of selected) {
+      let img;
+      try {
+        img = decodePng(await this.fs.readFile(entry.path));
+      } catch {
+        continue; // skip a torn/half-written frame rather than fail the sheet
+      }
+      frames.push({ image: img, index: entry.index, timeMs: entry.timeMs });
+    }
+    if (frames.length === 0) {
+      throw new Error('No decodable frames to compose a contact sheet');
     }
 
-    const sheet = composeContactSheet(frames, { cols: session.cols, thumbWidth });
-    const sheetBuffer = encodePng(sheet.width, sheet.height, sheet.data);
+    // --- 3. fit within the output budget (pixels + measured bytes) ----------
+    const built = composeWithinBudget(frames, {
+      cols: session.cols,
+      thumbWidth: session.thumbWidth,
+      maxPixels: this.limits.maxOutputPixels,
+      maxBytes: this.limits.maxOutputBytes,
+      encode: (img) => encodePng(img.width, img.height, img.data),
+    });
+
+    const sheetBuffer = built.buffer;
     const contactSheetPath = path.join(session.dir, 'contactsheet.png');
     await this.fs.writeFile(contactSheetPath, sheetBuffer);
     const latestPath = path.join(session.baseDir, 'latest-contactsheet.png');
     await this.fs.writeFile(latestPath, sheetBuffer).catch(() => {});
 
+    const warning = [selectionNote, built.warning].filter(Boolean).join(' ') || null;
+
+    // The frame numbers actually shown on the sheet (the budget loop may have
+    // dropped some of the selected frames); captions on the image match these.
+    const composedIndices = built.selected.map((f) => f.index);
+
     return {
-      contactSheet: { width: sheet.width, height: sheet.height, buffer: sheetBuffer, thumbWidth },
+      contactSheet: {
+        width: built.image.width,
+        height: built.image.height,
+        buffer: sheetBuffer,
+        thumbWidth: built.thumbWidth,
+        cols: built.cols,
+        composedFrames: built.frameCount,
+        composedIndices,
+      },
       contactSheetPath, latestPath, warning,
     };
+  }
+
+  // Decode each frame in a candidate pool once to compute a cheap grayscale
+  // change signature, discarding the full pixels immediately (bounded memory).
+  // Undecodable frames are skipped. Returns aligned { entries, sigs }.
+  async _signaturesFor(pool) {
+    const entries = [];
+    const sigs = [];
+    for (const entry of pool) {
+      let img;
+      try {
+        img = decodePng(await this.fs.readFile(entry.path));
+      } catch {
+        continue;
+      }
+      sigs.push(grayscaleSignature(img));
+      entries.push(entry);
+    }
+    return { entries, sigs };
   }
 
   _buildResult(session, committed, extra) {
@@ -584,8 +644,11 @@ export class SessionController {
       region: session.region,
       title: session.title,
       requestedRegion: session.region,
-      cols: session.cols,
+      cols: extra.contactSheet && extra.contactSheet.cols ? extra.contactSheet.cols : session.cols,
       thumbWidth: extra.contactSheet ? extra.contactSheet.thumbWidth : session.thumbWidth,
+      // How many frames are actually shown on the sheet (≤ frameCount); the rest
+      // remain on disk and are reachable with get_frame.
+      composedFrames: extra.contactSheet ? extra.contactSheet.composedFrames : null,
       detail: session.detail,
       capped: !!session._cappedFrames || !!session._cappedDisk,
       warnings: session.warnings.slice(),
@@ -693,6 +756,41 @@ export class SessionController {
   }
 }
 
+// Select `count` frames preferring those with the most visual CHANGE from the
+// previous frame, always keeping the first and last and preserving temporal
+// order. `entries` and `sigs` are aligned (sigs[i] is entries[i]'s signature).
+//
+// Rationale: a recording of a bug has long static stretches and a few moments
+// where something actually happens (a flash, a reorder, a drag landing). Even
+// time-sampling spends cells on the static stretches; this spends them on the
+// transitions, which is what the agent needs to see. Falls back to even
+// sampling when there is no change signal or signatures are unavailable.
+function selectByChange(entries, sigs, count) {
+  const n = entries.length;
+  if (n <= count) return entries.slice();
+  if (count < 2 || sigs.length !== n) return evenSample(entries, count);
+
+  // Per-frame change: how much each frame differs from the one before it. The
+  // first frame has no predecessor (change 0); it is kept explicitly below.
+  const change = new Array(n).fill(0);
+  let total = 0;
+  for (let i = 1; i < n; i++) {
+    change[i] = signatureDiff(sigs[i], sigs[i - 1]);
+    total += change[i];
+  }
+  // Nothing changed across the whole recording → no signal; sample by time.
+  if (total === 0) return evenSample(entries, count);
+
+  // Keep first + last; fill remaining slots with the highest-change interior
+  // frames (ties → earliest index, for determinism). Restore temporal order.
+  const keep = new Set([0, n - 1]);
+  const interior = [];
+  for (let i = 1; i < n - 1; i++) interior.push(i);
+  interior.sort((a, b) => (change[b] - change[a]) || (a - b));
+  for (let k = 0; k < interior.length && keep.size < count; k++) keep.add(interior[k]);
+  return [...keep].sort((a, b) => a - b).map((i) => entries[i]);
+}
+
 // Evenly sample `count` items from `arr`, always keeping the first and last.
 function evenSample(arr, count) {
   if (arr.length <= count) return arr.slice();
@@ -710,4 +808,4 @@ export async function readManifest(dir, fs = realFs) {
   return JSON.parse(raw);
 }
 
-export { DETAIL_PRESETS, normalizeDetail, clampNumber };
+export { DETAIL_PRESETS, normalizeDetail, clampNumber, selectByChange, evenSample };

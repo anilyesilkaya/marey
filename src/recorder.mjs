@@ -20,6 +20,7 @@ import { mkdir, writeFile, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
 import { captureFrame } from './capture.mjs';
 import { encodePng, decodePng } from './png.mjs';
+import { crop as cropImage } from './image.mjs';
 import { SessionController } from './session.mjs';
 import {
   createControlServer, openBrowser,
@@ -241,15 +242,27 @@ export async function capture(opts = {}) {
 }
 
 // Fetch a single full-resolution frame from a prior recording and return its
-// original PNG bytes. The contact sheet is a downscaled overview; when it is
-// not enough, this returns the real pixels — over MCP, so it works even for
-// clients with no filesystem access.
+// PNG bytes. The contact sheet is a downscaled overview; when it is not enough,
+// this returns the real pixels — over MCP, so it works even for clients with no
+// filesystem access.
 //
-// opts: either
+// Progressive inspection (Phase 3): pass a crop rectangle to zoom into part of
+// a frame at FULL resolution without transferring the whole image. The agent
+// reasons about the region from the downscaled sheet, so the rectangle may be
+// given in normalized fractions (0..1) of the frame — unambiguous regardless of
+// the frame's true pixel size — or in absolute pixels.
+//
+// opts: a frame locator —
 //   { dir, index }  — recording directory + 1-based frame number, or
 //   { path }        — a direct path to a frame PNG (e.g. from a record result)
+// plus an optional crop —
+//   { crop: { x, y, w, h, normalized } }  — sub-rectangle; when normalized is
+//     true, x/y/w/h are fractions of the frame (e.g. {x:0.5,y:0,w:0.5,h:0.5}
+//     = top-right quadrant); otherwise they are pixels. Out-of-bounds rects are
+//     clipped to the frame.
 //
-// Returns { path, width, height, buffer }.
+// Returns { path, width, height, buffer, source?: {width,height}, crop? }.
+// With no crop, the ORIGINAL bytes are returned untouched (byte-identical).
 export async function getFrame(opts = {}) {
   let framePath = opts.path;
 
@@ -271,10 +284,54 @@ export async function getFrame(opts = {}) {
     throw new Error(`Frame not found: ${framePath}`);
   }
 
-  // Validate it is a decodable PNG, and report true dimensions, without
-  // re-encoding — we return the original bytes untouched.
-  const { width, height } = decodePng(buffer);
-  return { path: framePath, width, height, buffer };
+  // No crop requested: validate it is a decodable PNG, report true dimensions,
+  // and return the original bytes untouched (no re-encode, byte-identical).
+  if (!opts.crop) {
+    const { width, height } = decodePng(buffer);
+    return { path: framePath, width, height, buffer };
+  }
+
+  // Crop requested: decode, resolve the rectangle (normalized or pixels) against
+  // the true frame size, crop at full resolution, re-encode.
+  const img = decodePng(buffer);
+  const rect = resolveCrop(opts.crop, img.width, img.height);
+  const cropped = cropImage(img, rect.x, rect.y, rect.w, rect.h);
+  const out = encodePng(cropped.width, cropped.height, cropped.data);
+  return {
+    path: framePath,
+    width: cropped.width,
+    height: cropped.height,
+    buffer: out,
+    source: { width: img.width, height: img.height },
+    crop: { x: rect.x, y: rect.y, w: cropped.width, h: cropped.height },
+  };
+}
+
+// Resolve a crop request against the true frame dimensions. Accepts normalized
+// fractions (0..1) or absolute pixels; clamps the origin into the frame and the
+// size to what remains, guaranteeing a non-empty in-bounds rectangle.
+function resolveCrop(cropOpt, frameW, frameH) {
+  if (!cropOpt || typeof cropOpt !== 'object') {
+    throw new Error('getFrame `crop` must be an object { x, y, w, h, normalized? }');
+  }
+  const normalized = !!cropOpt.normalized;
+  const sx = normalized ? frameW : 1;
+  const sy = normalized ? frameH : 1;
+  let x = Math.round(toNumber(cropOpt.x, 0) * sx);
+  let y = Math.round(toNumber(cropOpt.y, 0) * sy);
+  // Default size: the remainder of the frame from (x,y) when w/h are omitted.
+  let w = cropOpt.w == null ? frameW - x : Math.round(toNumber(cropOpt.w, 0) * sx);
+  let h = cropOpt.h == null ? frameH - y : Math.round(toNumber(cropOpt.h, 0) * sy);
+  x = Math.max(0, Math.min(x, frameW - 1));
+  y = Math.max(0, Math.min(y, frameH - 1));
+  w = Math.max(1, Math.min(w, frameW - x));
+  h = Math.max(1, Math.min(h, frameH - y));
+  return { x, y, w, h };
+}
+
+function toNumber(v, fallback) {
+  const n = typeof v === 'number' ? v : parseFloat(v);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 // Find the frame file for a 1-based index inside a recording directory. Frames
