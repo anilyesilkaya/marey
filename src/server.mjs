@@ -7,7 +7,7 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { StdioServer } from './jsonrpc.mjs';
-import { record, capture, getFrame, startRecording, stopRecording, recordingStatus } from './recorder.mjs';
+import { record, capture, getFrame, startRecording, stopRecording, recordingStatus, observe } from './recorder.mjs';
 import { listWindows, detectBackend } from './capture.mjs';
 import { TargetUnavailableError } from './capture.mjs';
 
@@ -97,6 +97,32 @@ const TOOLS = [
     inputSchema: { type: 'object', properties: {} },
   },
   {
+    name: 'observe',
+    description:
+      'Watch the USER reproduce something, hands-free. Starts a recording, ' +
+      'opens a small local control page in their browser, and BLOCKS until they ' +
+      'click Finish (or press F) — then returns the contact sheet exactly like ' +
+      'record. Use this for the common request "let me show you the bug": you ' +
+      'call observe, tell the user to reproduce it and click Finish when done, ' +
+      'and you receive the frames. Unlike record you do not guess a duration; ' +
+      'unlike start_recording the user ends it themselves (no second tool call ' +
+      'from you). A max-duration safety limit always returns. If no browser can ' +
+      'open (headless/remote), the control URL is printed to the server log and ' +
+      'the user can finish with the `marey finish` command.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        fps: { type: 'number', description: 'Frames captured per second (default 2).' },
+        region: { type: 'string', enum: ['primary', 'virtual', 'window'], description: 'Capture region (default primary).' },
+        title: { type: 'string', description: 'Window-title substring to match when region is "window".' },
+        maxSeconds: { type: 'number', description: 'Safety cap: auto-finish after this many seconds if the user never clicks (default 120, max 600).' },
+        detail: { type: 'string', enum: ['overview', 'high', 'max'], description: 'Contact-sheet legibility preset (default "overview"). See record.' },
+        cols: { type: 'number', description: 'Thumbnails per contact-sheet row. Overrides the detail preset.' },
+        thumbWidth: { type: 'number', description: 'Thumbnail width in pixels. Overrides the detail preset.' },
+      },
+    },
+  },
+  {
     name: 'list_windows',
     description:
       'List visible windows (title, process, and geometry where available) so ' +
@@ -169,6 +195,8 @@ server.method('tools/call', async (params) => {
         return handleStartRecording(args);
       case 'stop_recording':
         return handleStopRecording();
+      case 'observe':
+        return handleObserve(args);
       case 'capture':
         return handleCapture(args);
       case 'list_windows':
@@ -216,6 +244,23 @@ async function handleStopRecording() {
   const result = await stopRecording();
   const note = result.capped ? ' (stopped automatically at the frame cap)' : '';
   return contactSheetResult(result, `Stopped recording${note}; captured`);
+}
+
+async function handleObserve(args) {
+  // Surface the control URL on the server log so a headless/remote user (no
+  // auto-opened browser) can still open the page or run `marey finish`.
+  const result = await observe({
+    ...args,
+    onUrl: (url, opened) => {
+      server.log(`[marey] observation control page: ${url}` +
+        (opened ? ' (opened in your browser)' : ' (open this URL, or run `marey finish`)'));
+    },
+  });
+  const how =
+    result.observation === 'cancelled' ? 'Observation cancelled by the user; captured'
+    : result.observation === 'timed-out' ? 'Observation hit its time limit; captured'
+    : 'Observation finished by the user; captured';
+  return contactSheetResult(result, how);
 }
 
 // Shared formatter for record / stop_recording: a contact-sheet image plus a

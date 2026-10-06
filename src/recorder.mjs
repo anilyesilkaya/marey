@@ -21,6 +21,10 @@ import path from 'node:path';
 import { captureFrame } from './capture.mjs';
 import { encodePng, decodePng } from './png.mjs';
 import { SessionController } from './session.mjs';
+import {
+  createControlServer, openBrowser,
+  writeControlRegistry, clearControlRegistry,
+} from './control.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -116,6 +120,76 @@ export async function stopRecording() {
   }
   const result = await sharedController.stop();
   return resultOrThrow(result);
+}
+
+// --- observe: human-in-the-loop observation --------------------------------
+//
+// observe() is the headline Phase-2 workflow: the agent starts a recording, the
+// user reproduces a bug, and signals "done" via a local control page (or the
+// `marey finish` CLI). This call BLOCKS until that signal — a synchronous
+// pending request, not an MCP Task — then returns evidence exactly like
+// record()/stopRecording(). A bounded max-duration safety deadline guarantees
+// it always returns.
+//
+// opts: capture opts + { maxSeconds (default 120), open (default true),
+//   outputDir, onUrl(url) — notified with the control-page URL for a stderr
+//   fallback when no browser can be opened }.
+//
+// Returns a record()-shaped result with an extra `observation` field recording
+// how it ended ('finished' | 'cancelled' | 'timed-out').
+export async function observe(opts = {}) {
+  const controller = controllerFor(opts.outputDir);
+  const maxSeconds = clampNumber(opts.maxSeconds, 120, 1, 600);
+
+  // Start the recording first: if the backend cannot produce a frame, fail now
+  // (before opening a browser the user would stare at for nothing).
+  const started = await controller.start(captureOpts(opts));
+
+  // Stand up the local control surface, reporting live status from the session.
+  const control = createControlServer({
+    title: 'Marey',
+    getStatus: () => {
+      const s = controller.status(started.sessionId);
+      return {
+        frameCount: s.frameCount ?? 0,
+        elapsedMs: s.elapsedMs ?? 0,
+        region: s.region,
+        title: s.title,
+        fps: s.fps,
+      };
+    },
+  });
+
+  let result;
+  try {
+    await control.listen();
+    writeControlRegistry(control, { sessionId: started.sessionId, startedAt: started.startedAt });
+
+    // Offer the control page. If no browser can be opened (headless/remote),
+    // the caller surfaces the URL via onUrl so the user can open it manually.
+    const opened = opts.open === false ? false : openBrowser(control.url);
+    if (typeof opts.onUrl === 'function') opts.onUrl(control.url, opened);
+
+    // Bounded safety deadline: settle as 'timed-out' if the user never acts.
+    const timer = setTimeout(() => control.settle('timed-out'), maxSeconds * 1000);
+    if (typeof timer.unref === 'function') timer.unref();
+
+    // Block until the human finishes/cancels or the deadline fires.
+    const outcome = await control.outcome;
+    clearTimeout(timer);
+
+    // Map the human's intent onto the controller: Finish/timeout → stop (keep
+    // evidence); Cancel → cancel (still keeps partial evidence, flagged).
+    const raw = outcome === 'cancelled'
+      ? await controller.cancel(started.sessionId)
+      : await controller.stop(started.sessionId, { reason: outcome });
+
+    result = { ...resultOrThrow(raw), observation: outcome };
+  } finally {
+    clearControlRegistry();
+    await control.close().catch(() => {});
+  }
+  return result;
 }
 
 // Report whether a recording is active (for status / diagnostics).
