@@ -137,13 +137,30 @@ const TOOLS = [
       'is too small to read fine detail or small text, call this with the ' +
       "recording's directory and the frame number (both are listed in the " +
       '`record` response), or with a direct frame path. This works over MCP ' +
-      'without filesystem access.',
+      'without filesystem access.\n' +
+      'To ZOOM IN on part of a frame, pass `crop`. Easiest is a normalized ' +
+      'rectangle — fractions 0..1 of the frame — so you can target a region you ' +
+      'see on the contact sheet without knowing the exact pixel size: e.g. ' +
+      '{"normalized":true,"x":0.5,"y":0,"w":0.5,"h":0.5} is the top-right ' +
+      'quadrant. The crop is returned at full resolution, so a small UI detail ' +
+      'becomes legible without transferring the whole frame.',
     inputSchema: {
       type: 'object',
       properties: {
         dir: { type: 'string', description: 'Recording directory from a `record` result (its "dir" / "Frames saved under" path).' },
         index: { type: 'number', description: '1-based frame number to fetch (e.g. 4 for frame #004). Required when using `dir`.' },
         path: { type: 'string', description: 'Direct path to a frame PNG, as an alternative to dir + index.' },
+        crop: {
+          type: 'object',
+          description: 'Optional sub-rectangle to return at full resolution. Omit to get the whole frame.',
+          properties: {
+            normalized: { type: 'boolean', description: 'When true, x/y/w/h are fractions of the frame (0..1). When false/omitted, they are pixels.' },
+            x: { type: 'number', description: 'Left edge of the crop (fraction if normalized, else pixels). Default 0.' },
+            y: { type: 'number', description: 'Top edge of the crop (fraction if normalized, else pixels). Default 0.' },
+            w: { type: 'number', description: 'Crop width (fraction if normalized, else pixels). Default: to the right edge.' },
+            h: { type: 'number', description: 'Crop height (fraction if normalized, else pixels). Default: to the bottom edge.' },
+          },
+        },
       },
     },
   },
@@ -310,7 +327,11 @@ async function handleCapture(args) {
 
 async function handleGetFrame(args) {
   const frame = await getFrame(args);
-  const summary = `Frame at full resolution: ${frame.width}×${frame.height}px.\n${frame.path}`;
+  const summary = frame.crop
+    ? `Cropped frame at full resolution: ${frame.width}×${frame.height}px ` +
+      `(region ${frame.crop.x},${frame.crop.y} ${frame.crop.w}×${frame.crop.h} ` +
+      `from a ${frame.source.width}×${frame.source.height}px frame).\n${frame.path}`
+    : `Frame at full resolution: ${frame.width}×${frame.height}px.\n${frame.path}`;
   return {
     content: [
       imageContent(frame.buffer),

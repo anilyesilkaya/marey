@@ -6,6 +6,7 @@
 //   node src/cli.mjs session   --for 8 --fps 4 --detail high   (Ctrl+C stops early)
 //   node src/cli.mjs capture   --region window --title "Visual Studio"
 //   node src/cli.mjs get-frame --dir captures/20260101-120000 --index 4
+//   node src/cli.mjs get-frame --dir ... --index 4 --normalized --crop-x 0.5 --crop-w 0.5  (zoom)
 //   node src/cli.mjs finish    (end the active observation; alias: stop)
 //   node src/cli.mjs windows
 //   node src/cli.mjs backend
@@ -26,6 +27,20 @@ function isFalsey(v) {
   if (v === 0) return true;
   if (typeof v === 'string') return /^(false|0|no|off)$/i.test(v);
   return false;
+}
+
+// Build a getFrame crop rectangle from CLI flags, or return undefined when no
+// crop flag is present. --normalized makes x/y/w/h fractions of the frame.
+function buildCropArg(args) {
+  const keys = ['crop-x', 'crop-y', 'crop-w', 'crop-h'];
+  if (!keys.some((k) => args[k] !== undefined)) return undefined;
+  return {
+    normalized: !!args.normalized && !isFalsey(args.normalized),
+    x: args['crop-x'],
+    y: args['crop-y'],
+    w: args['crop-w'],
+    h: args['crop-h'],
+  };
 }
 
 function parseArgs(argv) {
@@ -64,8 +79,17 @@ async function main() {
       break;
     }
     case 'get-frame': {
-      const r = await getFrame(args);
-      console.log(`Frame ${r.width}×${r.height} (full resolution) → ${r.path}`);
+      // Optional crop: --crop-x/-y/-w/-h (pixels, or fractions with --normalized).
+      const crop = buildCropArg(args);
+      const r = await getFrame({ ...args, crop });
+      if (r.crop) {
+        console.log(
+          `Frame ${r.width}×${r.height} (crop ${r.crop.x},${r.crop.y} ` +
+          `${r.crop.w}×${r.crop.h} of ${r.source.width}×${r.source.height}) → ${r.path}`,
+        );
+      } else {
+        console.log(`Frame ${r.width}×${r.height} (full resolution) → ${r.path}`);
+      }
       break;
     }
     case 'session': {

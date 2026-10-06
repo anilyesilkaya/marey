@@ -87,6 +87,9 @@ export function tinyPng(w = 8, h = 6, fill = [10, 20, 30, 255]) {
 //         'exit-after'   — emit `exitAfter` frames then exit (mid-recording crash)
 //   width,height         — frame dimensions (for oversized-frame tests)
 //   error                — error string surfaced via handle.error
+//   fills                — explicit per-frame [r,g,b,a] fills (cycled if shorter
+//                          than the frame count); lets a test script exactly
+//                          which frames change, for selection tests
 //
 // All timing is scheduled on the injected fake clock, so clock.advance(ms)
 // deterministically produces frames.
@@ -95,6 +98,7 @@ export function createFakeBackend(clock, opts = {}) {
   const slowFactor = opts.slowFactor || 3;
   const w = opts.width || 8;
   const h = opts.height || 6;
+  const fills = opts.fills || null;
   const errorText = opts.error || (mode === 'fail-first' ? 'fake backend: no capture device' : null);
 
   return {
@@ -115,7 +119,9 @@ export function createFakeBackend(clock, opts = {}) {
         const tick = () => {
           if (stopped || exited) return;
           count++;
-          const fill = [count % 256, (count * 7) % 256, 30, 255];
+          const fill = fills
+            ? fills[(count - 1) % fills.length]
+            : [count % 256, (count * 7) % 256, 30, 255];
           onFrame({ png: tinyPng(w, h, fill), timeMs: Math.round(clock.now() - startMono) }, count);
           if (mode === 'exit-after' && count >= (opts.exitAfter || 2)) {
             exited = true; resolveClosed();
