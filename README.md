@@ -168,16 +168,55 @@ The agent receives the complete sequence as a single image and can reason about 
 
 ## Command-line use
 
-Marey also runs standalone, which is handy for verifying your capture backend
-before wiring up an MCP client:
+Marey runs standalone from the repo — the easiest way to try the whole workflow,
+including the interactive **observe** and **replay** modes, without wiring up an
+MCP client. Clone it first (see [From source](#from-source)); every command is
+`node src/cli.mjs <command>`.
+
+**Diagnose capture** — confirm the backend actually works on this machine before
+anything else:
 
 ```bash
-node src/cli.mjs backend                 # report the detected capture backend
-node src/cli.mjs windows                 # list targetable windows
-node src/cli.mjs capture --region primary
-node src/cli.mjs record --seconds 4 --fps 4 --detail high
-node src/cli.mjs record --region window --title "Visual Studio Code" --seconds 6 --fps 4 --detail max
+node src/cli.mjs doctor                  # probe the backend with a REAL one-frame capture (pass/fail)
+node src/cli.mjs backend                 # just name the detected backend
+node src/cli.mjs windows                 # list targetable windows (hidden ones are flagged)
 ```
+
+**Record a fixed clip** — you choose the duration up front:
+
+```bash
+node src/cli.mjs capture --region primary                                   # one frame
+node src/cli.mjs record --seconds 4 --fps 4 --detail high                   # 4s of the screen
+node src/cli.mjs record --region window --title "Chrome" --fps 4 --detail max  # just one window
+```
+
+**Capture an unpredictable moment** — when *you* control the timing:
+
+```bash
+# observe: a browser control page opens; reproduce the issue, then click Finish
+# (or run `marey finish` from any terminal) and the same call returns the sheet.
+node src/cli.mjs observe --fps 3 --detail high
+node src/cli.mjs finish                  # ...from a second terminal, to end it
+
+# replay: a rolling buffer always holds the last few seconds (a dashcam). Press
+# Mark the instant something glitches; each mark becomes its own clip.
+node src/cli.mjs replay --window-seconds 10 --fps 4
+node src/cli.mjs mark                     # ...from a second terminal, to pin the look-back window
+node src/cli.mjs finish                   # ...then end it — one contact sheet per mark
+```
+
+**Inspect a frame** — zoom into any frame at full resolution without re-recording:
+
+```bash
+node src/cli.mjs get-frame --dir captures/<timestamp> --index 7
+node src/cli.mjs get-frame --dir captures/<timestamp> --index 7 \
+  --normalized --crop-x 0.5 --crop-y 0 --crop-w 0.5 --crop-h 0.5   # top-right quadrant
+```
+
+Window capture grabs the window's **own surface** (via `PrintWindow`), so it
+works even when the target is behind other windows. A minimized or off-screen
+window has nothing to render, so Marey reports that rather than capturing junk —
+restore the window (`node src/cli.mjs windows` flags which are hidden).
 
 ### A note on frame rate
 

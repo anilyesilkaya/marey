@@ -199,7 +199,8 @@ async function main() {
       }
       for (const w of windows) {
         const geo = w.width != null ? ` [${w.width}×${w.height} @ ${w.x},${w.y}]` : '';
-        console.log(`• ${w.title}${w.process ? ` (${w.process})` : ''}${geo}`);
+        const hidden = w.hidden ? ' — hidden (minimized/other desktop; restore to capture)' : '';
+        console.log(`• ${w.title}${w.process ? ` (${w.process})` : ''}${geo}${hidden}`);
       }
       break;
     }

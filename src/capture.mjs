@@ -63,34 +63,86 @@ export class TargetUnavailableError extends Error {
 
 // --- Windows backend (PowerShell + System.Drawing) -------------------------
 
-// Shared PowerShell helper that resolves the capture rectangle for a region.
-// For region 'window' it throws when no window matches — target validation is
-// inherent to the backend, so an open stream fails fast instead of capturing
-// the desktop by mistake. The returned rectangle is the window's visible SCREEN
-// rectangle (a crop), not an occlusion-free surface grab.
-function psTargetBounds(region, title, className) {
+// Shared PowerShell helpers for capture. Window capture uses PrintWindow with
+// PW_RENDERFULLCONTENT, which asks the window to render its OWN surface into an
+// off-screen bitmap — so it is occlusion-proof (works even when another window
+// is on top) and captures DWM/GPU-composited apps (Chrome, Electron). This is a
+// true window grab, not a crop of the screen rectangle where the window sits.
+//
+// A minimized or cloaked (another virtual desktop / suspended UWP) window has no
+// renderable surface, so we detect that and throw a MAREY_TARGET: sentinel error
+// rather than returning a tiny garbage frame. The window is rendered into a
+// 24bpp RGB bitmap on purpose: a 32bpp PrintWindow surface comes back with a
+// zero alpha channel and would save as an all-transparent PNG.
+function psCaptureCommon(className) {
   return `
-function Get-TargetBounds {
-  param($region, $title)
-  if ($region -eq 'virtual') {
-    return [System.Windows.Forms.SystemInformation]::VirtualScreen
-  }
-  if ($region -eq 'window') {
-    Add-Type @"
+Add-Type @"
 using System;
 using System.Runtime.InteropServices;
 public struct RECT { public int Left, Top, Right, Bottom; }
 public class ${className} {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr hWnd, IntPtr hdcBlt, uint nFlags);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr hWnd);
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 }
 "@
-    $proc = Get-Process | Where-Object { $_.MainWindowTitle -like "*$title*" -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
-    if ($null -eq $proc) { throw "No visible window matching '$title'" }
-    $rect = New-Object RECT
-    [void][${className}]::GetWindowRect($proc.MainWindowHandle, [ref]$rect)
-    return New-Object System.Drawing.Rectangle($rect.Left, $rect.Top, ($rect.Right - $rect.Left), ($rect.Bottom - $rect.Top))
+
+function Find-TargetWindow {
+  param($title)
+  $proc = Get-Process | Where-Object { $_.MainWindowTitle -like "*$title*" -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
+  if ($null -eq $proc) { throw "MAREY_TARGET:No window with a title matching '$title'" }
+  return $proc.MainWindowHandle
+}
+
+# A window is uncapturable when minimized (IsIconic) or cloaked by DWM
+# (DWMWA_CLOAKED = 14 → on another virtual desktop or a suspended UWP app).
+function Test-WindowHidden {
+  param($hwnd)
+  if ([${className}]::IsIconic($hwnd)) { return $true }
+  $cloaked = 0
+  try { [void][${className}]::DwmGetWindowAttribute($hwnd, 14, [ref]$cloaked, 4) } catch {}
+  return ($cloaked -ne 0)
+}
+
+function Assert-Capturable {
+  param($hwnd, $title)
+  if (Test-WindowHidden $hwnd) {
+    throw "MAREY_TARGET:Window '$title' is minimized or hidden; restore it on screen to capture it"
   }
-  return [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+}
+
+function New-WindowBitmap {
+  param($hwnd)
+  $rect = New-Object RECT
+  [void][${className}]::GetWindowRect($hwnd, [ref]$rect)
+  $w = $rect.Right - $rect.Left
+  $h = $rect.Bottom - $rect.Top
+  if ($w -le 0 -or $h -le 0) { throw "MAREY_TARGET:Window '$hwnd' reports no on-screen area to capture" }
+  $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+  $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+  $hdc = $gfx.GetHdc()
+  # PW_RENDERFULLCONTENT = 2 → render DWM/GPU-composited content, not a black box.
+  $ok = [${className}]::PrintWindow($hwnd, $hdc, 2)
+  $gfx.ReleaseHdc($hdc)
+  $gfx.Dispose()
+  if (-not $ok) { $bmp.Dispose(); throw "MAREY_TARGET:PrintWindow could not render the target window" }
+  return $bmp
+}
+
+function New-ScreenBitmap {
+  param($region)
+  if ($region -eq 'virtual') {
+    $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+  } else {
+    $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  }
+  $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
+  $gfx = [System.Drawing.Graphics]::FromImage($bmp)
+  $gfx.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+  $gfx.Dispose()
+  return $bmp
 }`;
 }
 
@@ -106,14 +158,17 @@ function windowsCaptureScript(region, title) {
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
-${psTargetBounds(region, title, 'Win32Single')}
-$bounds = Get-TargetBounds -region '${psQuote(region)}' -title '${psQuote(title)}'
-$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
-$gfx = [System.Drawing.Graphics]::FromImage($bmp)
-$gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+${psCaptureCommon('Win32Single')}
+if ('${psQuote(region)}' -eq 'window') {
+  $hwnd = Find-TargetWindow -title '${psQuote(title)}'
+  Assert-Capturable $hwnd '${psQuote(title)}'
+  $bmp = New-WindowBitmap $hwnd
+} else {
+  $bmp = New-ScreenBitmap -region '${psQuote(region)}'
+}
 $ms = New-Object System.IO.MemoryStream
 $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
-$gfx.Dispose(); $bmp.Dispose()
+$bmp.Dispose()
 [Console]::Out.Write([Convert]::ToBase64String($ms.ToArray()))
 `;
 }
@@ -128,12 +183,18 @@ async function grabWindows({ region, title }) {
     );
     return Buffer.from(stdout.trim(), 'base64');
   } catch (err) {
-    const msg = (err.stderr || err.message || '').toString();
-    if (region === 'window' && /No visible window matching/.test(msg)) {
-      throw new TargetUnavailableError(`Window capture target not found: "${title}"`);
-    }
-    throw err;
+    throw mapTargetError(err, region);
   }
+}
+
+// Translate a PowerShell failure into a TargetUnavailableError when it carries
+// our MAREY_TARGET: sentinel (window not found / minimized / cloaked / no
+// surface). Everything else propagates unchanged.
+function mapTargetError(err, region) {
+  const msg = (err.stderr || err.message || '').toString();
+  const m = msg.match(/MAREY_TARGET:(.+)/);
+  if (m) return new TargetUnavailableError(m[1].trim());
+  return err;
 }
 
 // Open-ended streaming capture: grab frames at `intervalMs` spacing in an
@@ -143,14 +204,36 @@ async function grabWindows({ region, title }) {
 // backend falls behind (rather than firing a burst of catch-up frames), so a
 // slow host yields fewer, wider-spaced frames with truthful timestamps.
 function windowsStreamScript(region, title, intervalMs) {
+  const isWindow = region === 'window';
+  // Window streams render the window's own surface fresh each frame (its size or
+  // content can change). Screen streams reuse one bitmap + CopyFromScreen, which
+  // is cheaper. Startup resolves + validates the target up front so an open
+  // stream fails fast (readiness error) instead of looping on a bad target.
+  const setup = isWindow
+    ? `
+$hwnd = Find-TargetWindow -title '${psQuote(title)}'
+Assert-Capturable $hwnd '${psQuote(title)}'`
+    : `
+$bounds = if ('${psQuote(region)}' -eq 'virtual') { [System.Windows.Forms.SystemInformation]::VirtualScreen } else { [System.Windows.Forms.Screen]::PrimaryScreen.Bounds }
+$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
+$gfx = [System.Drawing.Graphics]::FromImage($bmp)`;
+  // Per-frame grab. For a window: skip the frame if it is transiently minimized
+  // (gap in the timeline is honest; we never fall back to the desktop). For a
+  // screen: blit into the reused bitmap.
+  const grabFrame = isWindow
+    ? `
+  if (Test-WindowHidden $hwnd) { if ($interval -gt 0) { $i = [math]::Floor($sw.Elapsed.TotalMilliseconds / $interval) + 1 } else { $i++ }; continue }
+  try { $frame = New-WindowBitmap $hwnd } catch { if ($interval -gt 0) { $i = [math]::Floor($sw.Elapsed.TotalMilliseconds / $interval) + 1 } else { $i++ }; continue }`
+    : `
+  $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+  $frame = $bmp`;
+  const disposeFrame = isWindow ? '$frame.Dispose()' : '';
   return `
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
-${psTargetBounds(region, title, 'Win32Stream')}
-$bounds = Get-TargetBounds -region '${psQuote(region)}' -title '${psQuote(title)}'
-$bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
-$gfx = [System.Drawing.Graphics]::FromImage($bmp)
+${psCaptureCommon('Win32Stream')}
+${setup}
 $stdout = [Console]::Out
 $sw = [System.Diagnostics.Stopwatch]::StartNew()
 $interval = [double]${intervalMs}
@@ -159,13 +242,13 @@ while ($true) {
   $target = $i * $interval
   $wait = $target - $sw.Elapsed.TotalMilliseconds
   if ($wait -gt 0) { Start-Sleep -Milliseconds ([int]$wait) }
-
-  $gfx.CopyFromScreen($bounds.Location, [System.Drawing.Point]::Empty, $bounds.Size)
+${grabFrame}
   $elapsed = $sw.Elapsed.TotalMilliseconds
   $ms = New-Object System.IO.MemoryStream
-  $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
+  $frame.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   $stdout.WriteLine("FRAME " + [int]$elapsed + " " + [Convert]::ToBase64String($ms.ToArray()))
   $ms.Dispose()
+  ${disposeFrame}
   # Skip any slots we already missed so we never accumulate a backlog.
   if ($interval -gt 0) { $i = [math]::Floor($elapsed / $interval) + 1 } else { $i++ }
 }
@@ -216,7 +299,11 @@ function startStreamWindows({ region, title, intervalMs }, onFrame) {
     get error() {
       if (spawnError) return spawnError.message;
       const text = errChunks.length ? Buffer.concat(errChunks).toString('utf8').trim() : '';
-      return text || null;
+      if (!text) return null;
+      // Surface our own target sentinel as a clean message rather than the raw
+      // PowerShell stack trace (e.g. a minimized/missing window target).
+      const m = text.match(/MAREY_TARGET:(.+)/);
+      return m ? m[1].trim() : text;
     },
   };
 }
@@ -230,17 +317,26 @@ using System.Runtime.InteropServices;
 public struct RECT { public int Left, Top, Right, Bottom; }
 public class Win32List {
   [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+  [DllImport("user32.dll")] public static extern bool IsIconic(IntPtr hWnd);
+  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr hWnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 }
 "@
 $procs = Get-Process | Where-Object { $_.MainWindowTitle -ne '' -and $_.MainWindowHandle -ne 0 }
 $list = foreach ($p in $procs) {
+  $h = $p.MainWindowHandle
   $rect = New-Object RECT
-  [void][Win32List]::GetWindowRect($p.MainWindowHandle, [ref]$rect)
+  [void][Win32List]::GetWindowRect($h, [ref]$rect)
+  # A window is uncapturable when minimized (IsIconic) or cloaked by DWM
+  # (DWMWA_CLOAKED = 14 → another virtual desktop / suspended UWP app).
+  $cloaked = 0
+  try { [void][Win32List]::DwmGetWindowAttribute($h, 14, [ref]$cloaked, 4) } catch {}
+  $hidden = [Win32List]::IsIconic($h) -or ($cloaked -ne 0)
   [PSCustomObject]@{
     title  = $p.MainWindowTitle
     process = $p.ProcessName
     x = $rect.Left; y = $rect.Top
     width = ($rect.Right - $rect.Left); height = ($rect.Bottom - $rect.Top)
+    hidden = [bool]$hidden
   }
 }
 $list | ConvertTo-Json -Compress
