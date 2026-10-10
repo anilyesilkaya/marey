@@ -18,10 +18,12 @@
 
 import { mkdir, writeFile, readFile, readdir } from 'node:fs/promises';
 import path from 'node:path';
-import { captureFrame } from './capture.mjs';
+import { captureImage } from './capture.mjs';
 import { encodePng, decodePng } from './png.mjs';
 import { crop as cropImage } from './image.mjs';
-import { SessionController } from './session.mjs';
+import { SessionController, selectByChange } from './session.mjs';
+import { composeWithinBudget } from './contactsheet.mjs';
+import { grayscaleSignature } from './image.mjs';
 import {
   createControlServer, openBrowser,
   writeControlRegistry, clearControlRegistry,
@@ -44,6 +46,7 @@ function stamp(date) {
 // callers (server, CLI) use the default, and an explicit, different outputDir is
 // honoured only while idle so a one-off directory override still works.
 let sharedController = null;
+let openSessionId = null;
 
 function controllerFor(outputDir) {
   const baseDir = outputDir || path.join(process.cwd(), 'captures');
@@ -61,6 +64,8 @@ function captureOpts(opts) {
     fps: opts.fps,
     region: opts.region,
     title: opts.title,
+    windowId: opts.windowId,
+    rect: opts.rect,
     delay: opts.delay,
     detail: opts.detail,
     cols: opts.cols,
@@ -107,23 +112,28 @@ export async function record(opts = {}) {
 export async function startRecording(opts = {}) {
   const controller = controllerFor(opts.outputDir);
   const started = await controller.start(captureOpts(opts));
+  openSessionId = started.sessionId;
   return {
     dir: started.dir,
     fps: started.fps,
     region: started.region,
     title: started.title,
     detail: started.detail,
+    target: started.target,
   };
 }
 
 // Stop the active recording and compose a contact sheet. Returns the same shape
 // as record(). Errors if no recording is in progress.
 export async function stopRecording() {
-  if (!sharedController || !sharedController.active) {
+  if (!sharedController || !openSessionId) {
     throw new Error('No recording is in progress. Call start_recording first.');
   }
-  const result = await sharedController.stop();
-  return resultOrThrow(result);
+  // Automatic caps and backend failures may have finalized the session already.
+  // Retrieve its preserved result rather than discarding the partial evidence.
+  const id = openSessionId;
+  try { return resultOrThrow(await sharedController.stop(id)); }
+  finally { if (openSessionId === id) openSessionId = null; }
 }
 
 // --- observe: human-in-the-loop observation --------------------------------
@@ -311,7 +321,7 @@ export async function capture(opts = {}) {
   const dir = path.join(baseDir, stamp(now));
   await mkdir(dir, { recursive: true });
 
-  const image = await captureFrame({ region, title });
+  const { image, target, backend } = await captureImage({ region, title, windowId: opts.windowId, rect: opts.rect });
   const buffer = encodePng(image.width, image.height, image.data);
   const framePath = path.join(dir, 'capture.png');
   await writeFile(framePath, buffer);
@@ -327,6 +337,7 @@ export async function capture(opts = {}) {
     height: image.height,
     region,
     title: title || null,
+    target, backend,
     image: { width: image.width, height: image.height, buffer },
   };
 }
@@ -394,6 +405,61 @@ export async function getFrame(opts = {}) {
     buffer: out,
     source: { width: img.width, height: img.height },
     crop: { x: rect.x, y: rect.y, w: cropped.width, h: cropped.height },
+  };
+}
+
+// Inspect a chronological time range, retaining transition neighborhoods rather
+// than forcing the agent to make one get_frame call per image.
+export async function getFrames(opts = {}) {
+  if (!opts.dir) throw new Error('getFrames requires a recording dir');
+  const startMs = opts.startMs ?? 0;
+  const endMs = opts.endMs ?? Number.MAX_SAFE_INTEGER;
+  const maxFrames = opts.maxFrames ?? 12;
+  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || startMs < 0 || endMs < startMs) {
+    throw new Error('Time range requires 0 <= startMs <= endMs, in milliseconds');
+  }
+  if (!Number.isInteger(maxFrames) || maxFrames < 2 || maxFrames > 36) throw new Error('maxFrames must be an integer from 2 to 36');
+  const manifest = JSON.parse(await readFile(path.join(opts.dir, 'manifest.json'), 'utf8'));
+  if (manifest.manifestVersion !== 1 || !Array.isArray(manifest.frames)) throw new Error('Unsupported recording manifest');
+  const entries = manifest.frames.filter((f) => f.timeMs >= startMs && f.timeMs <= endMs).sort((a, b) => a.timeMs - b.timeMs || a.index - b.index);
+  if (!entries.length) throw new Error('No recorded frames in this time range; widen it or inspect capture gaps');
+  const candidates = [];
+  const signatures = new Map();
+  const warnings = [];
+  for (const entry of entries) {
+    try {
+      if (path.basename(entry.file) !== entry.file) throw new Error('Invalid manifest frame filename');
+      const image = decodePng(await readFile(path.join(opts.dir, entry.file)));
+      const rect = opts.crop ? resolveCrop(opts.crop, image.width, image.height) : null;
+      const cropped = rect ? cropImage(image, rect.x, rect.y, rect.w, rect.h) : image;
+      signatures.set(entry.index, grayscaleSignature(cropped));
+      candidates.push(entry);
+    } catch (err) { warnings.push(`Frame #${entry.index} unavailable: ${err.message}`); }
+  }
+  if (!candidates.length) throw new Error('No readable frames in this time range');
+  const pick = (pool, count) => selectByChange(pool, pool.map((f) => signatures.get(f.index)), count);
+  const frames = [];
+  for (const entry of pick(candidates, maxFrames)) {
+    const image = decodePng(await readFile(path.join(opts.dir, entry.file)));
+    const rect = opts.crop ? resolveCrop(opts.crop, image.width, image.height) : null;
+    frames.push({ image: rect ? cropImage(image, rect.x, rect.y, rect.w, rect.h) : image, index: entry.index, timeMs: entry.timeMs });
+  }
+  const built = composeWithinBudget(frames, {
+    cols: 2, thumbWidth: 760, maxPixels: 24_000_000, maxBytes: 3_500_000,
+    selectFrames: pick, encode: (img) => encodePng(img.width, img.height, img.data),
+  });
+  if (built.buffer.length > 3_500_000 || built.image.width * built.image.height > 24_000_000) throw new Error('Time-range sheet exceeds the output budget; use a smaller crop');
+  if (built.warning) warnings.push(built.warning);
+  return {
+    dir: opts.dir, requestedRange: { startMs, endMs: opts.endMs ?? null },
+    availableFrames: entries.length,
+    frames: built.selected.map((f) => ({ index: f.index, timeMs: f.timeMs })),
+    target: manifest.target, quality: manifest.quality || null,
+    actual: manifest.actual || null, state: manifest.state || null, completionReason: manifest.completionReason || null,
+    captureWarnings: manifest.warnings || [], captureErrors: manifest.errors || [],
+    rangeQuality: { status: warnings.length ? 'degraded' : 'complete', unreadableFrames: entries.length - candidates.length },
+    warnings, crop: opts.crop || null,
+    image: { width: built.image.width, height: built.image.height, buffer: built.buffer },
   };
 }
 

@@ -328,10 +328,10 @@ test('contact sheet selects high-change frames when there are more than the cell
   assert.equal(shown.length, 4, 'sheet shows exactly the cell cap');
   assert.equal(shown[0], 1, 'first frame kept');
   assert.equal(shown[shown.length - 1], result.frameCount, 'last frame kept');
-  // The two interior transitions (frames 6 and 9) must be chosen over the
-  // static frames an even sample (4, 8) would have taken.
+  // A four-cell budget retains the immediate before/changed pair for the
+  // strongest transition, instead of displaying two disconnected changes.
   assert.ok(shown.includes(6), `expected the flash frame #6 in ${shown}`);
-  assert.ok(shown.includes(9), `expected the change frame #9 in ${shown}`);
+  assert.ok(shown.includes(5), `expected the frame immediately before the flash in ${shown}`);
   assert.ok(result.warnings.some((w) => /selected by visual change/.test(w)));
 });
 

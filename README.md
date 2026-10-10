@@ -66,7 +66,7 @@ The idea is deliberately simple:
 
 ## Tools
 
-Marey exposes six MCP tools:
+Marey exposes ten MCP tools:
 
 | Tool | What it does |
 | --- | --- |
@@ -75,16 +75,22 @@ Marey exposes six MCP tools:
 | `stop_recording` | Stops the open-ended recording and returns the contact sheet |
 | `capture` | Captures a single screenshot |
 | `get_frame` | Returns one frame from a recording at **full resolution** |
-| `list_windows` | Lists visible windows that can be targeted for capture |
+| `list_windows` | Lists window IDs, titles, bounds, and hidden state |
+| `observe` | Records until the user finishes through the local control page |
+| `replay` | Keeps a rolling buffer and returns clips around user markers |
+| `status` | Reports recording state |
+| `get_frames` | Returns a contact sheet for a time range, with optional crop |
 
 ### `record`
 
 | Parameter | Default | Description |
 | --- | ---: | --- |
 | `seconds` | `5` | Recording duration |
-| `fps` | `2` | Frames captured per second |
+| `fps` | `15` | Target frames per second; achieved rate and gaps are reported |
 | `region` | `primary` | `primary`, `virtual`, or `window` |
-| `title` | — | Window-title substring when `region` is `window` |
+| `title` | — | Unambiguous visible window-title substring when `region` is `window` |
+| `windowId` | — | Exact native window ID from `list_windows`; takes precedence over `title` |
+| `rect` | — | `{x,y,w,h}` in target-relative pixels; restricts the captured source during recording |
 | `delay` | `0` | Delay before capture begins |
 | `detail` | `overview` | Legibility preset: `overview`, `high`, or `max` (see below) |
 | `cols` | `4` | Number of thumbnails per contact-sheet row (overrides `detail`) |
@@ -127,7 +133,7 @@ the timing (you will drag something, open a menu, trigger an animation and the
 duration is unpredictable), use the open-ended pair instead:
 
 1. The agent calls `start_recording` on your cue (same parameters as `record`
-   except `seconds`: `fps`, `region`, `title`, `delay`, `detail`, `cols`,
+   except `seconds`: `fps`, `region`, `title`/`windowId`, `rect`, `delay`, `detail`, `cols`,
    `thumbWidth`).
 2. You perform the interaction.
 3. The agent calls `stop_recording`, which composes and returns the contact
@@ -218,16 +224,76 @@ works even when the target is behind other windows. A minimized or off-screen
 window has nothing to render, so Marey reports that rather than capturing junk —
 restore the window (`node src/cli.mjs windows` flags which are hidden).
 
+### Inspecting evidence quality and transitions
+
+Recording results include requested and achieved FPS, mean spacing, maximum
+frame gap, completion reason, warnings, errors, and the resolved target ID and
+bounds. New MCP clients (protocol 2025-06-18 or later) also receive these as
+`structuredContent`; older clients receive the same quality information as text.
+Partial recordings remain inspectable and failed recordings return `isError:true`
+alongside any available images. `stop_recording` retrieves evidence even if the
+backend already stopped automatically.
+
+A contact sheet selects neighborhoods around the strongest transitions: the
+immediate **before**, **changed**, and **following** frames. Larger budgets also
+retain the beginning and end of the recording. Small budgets favor transition
+context over distant endpoints. Every stored frame is analyzed sequentially,
+so analysis does not discard a brief event through preliminary time sampling.
+Raw frames remain available even when the contact sheet must shrink.
+
+Use `get_frames` to inspect a narrower time range together:
+
+```text
+get_frames { dir: "<recording dir>", startMs: 800, endMs: 1400, maxFrames: 12,
+             crop: { normalized: true, x: 0.3, y: 0.2, w: 0.4, h: 0.5 } }
+```
+
+Times are inclusive acquisition timestamps in milliseconds. This returns one
+budgeted contact sheet, the displayed frame indices/times, and source quality
+metadata. It fails explicitly if no frames exist in the requested range.
+
+For a smaller recording source (rather than an output-only crop), use:
+
+```text
+record { seconds: 2, fps: 20, region: "window", windowId: "<ID from list_windows>",
+         rect: { x: 0, y: 0, w: 640, h: 480 }, detail: "high" }
+```
+
+Hidden windows are rejected. Ambiguous titles require an exact ID. Linux window
+capture is a screen-rectangle grab and can be occluded; Windows uses the window's
+own surface. Bounds describe target resolution at capture startup; frame metadata
+includes actual dimensions when a window changes size.
+
+CLI equivalents:
+
+```bash
+node src/cli.mjs record --seconds 2 --fps 20 --region window --window-id <id> \
+  --rect-x 0 --rect-y 0 --rect-w 640 --rect-h 480
+node src/cli.mjs get-frames --dir captures/<recording> --start-ms 800 --end-ms 1400 \
+  --max-frames 12 --out /tmp/transition.png
+```
+
 ### A note on frame rate
 
-`fps` is the **target** rate. The achievable rate is bounded by how fast the
-host can grab and encode a frame — on a 2560×1440 primary monitor, a full-screen
-grab plus PNG save costs a few hundred milliseconds, so the practical ceiling is
-roughly 2–3 fps at full resolution. Capturing a smaller `region` (or a single
-`window`) is faster. On Windows, an entire recording runs inside **one**
-PowerShell process rather than one per frame, so capture is not throttled by
-process-startup overhead. Frame labels show the *actual* elapsed time of each
-frame, so the timeline is always truthful even when the target rate is not met.
+`fps` is the **target** rate (default **15**). A short event can still fall
+between samples; an absent frame is not proof that a flicker did not occur.
+Check **achieved FPS** and **maximum frame gap** before making timing claims.
+
+X11 uses one persistent FFmpeg process when `ffmpeg` and `xdotool` are available.
+macOS uses FFmpeg's AVFoundation screen input when available; Screen Recording
+permission is required. Frames use acquisition PTS, not PNG arrival times. Windows
+keeps its existing single PowerShell stream. Smaller capture rectangles reduce
+encoding and transfer work; Windows window-surface capture must still render the
+full window before cropping.
+
+Wayland and hosts without a continuous backend use native single-frame commands,
+scheduled against deadlines so capture/encoding time is not added to every frame
+interval. Results explicitly report that fallback. Installing FFmpeg enables
+continuous X11/macOS capture, but does not establish its achievable rate.
+
+On Linux/X11 in development validation, a 320×240 capture reached 20 fps with
+50ms frame gaps, and an isolated real-pixel test captured a 100ms flash. This is
+a tested configuration, not a guarantee for other hosts or resolutions.
 
 ---
 
@@ -310,12 +376,22 @@ Marey auto-detects an available screen-capture backend.
 | Platform | Full / monitor capture | Window capture |
 | --- | --- | --- |
 | Windows 10/11 | Built-in PowerShell + `System.Drawing` | Built-in |
-| Linux · X11 | `scrot`, ImageMagick `import`, or `ffmpeg` | `ffmpeg` + `xdotool` |
+| Linux · X11 | ImageMagick/scrot for screenshots; FFmpeg + xdotool for continuous capture | `ffmpeg` + `xdotool` + `xwininfo` |
 | Linux · Wayland | `grim` | Compositor-dependent |
-| macOS | Built-in `screencapture` | Not yet supported |
+| macOS | Built-in `screencapture`; optional FFmpeg AVFoundation stream | Not yet supported |
 
-On Linux, window listing uses `wmctrl` or `xdotool` where available. If
-`ffmpeg` is on `PATH`, Marey can use it for X11 capture where supported.
+On X11, window listing and validation use `xdotool` and `xwininfo`; `xrandr`
+identifies the primary monitor when available. ImageMagick output is forced to
+8-bit, non-interlaced RGB so monochrome screens remain decodable. Wayland supports
+`virtual` capture or an explicit rectangle; it rejects window capture and cannot
+infer a primary output. macOS supports `primary`/rectangles, not a virtual desktop.
+Native Windows/macOS changes require validation on those platforms; the new
+real-pixel regression is currently Linux/X11-only.
+
+Run ordinary tests with `npm test`. For real X11 coverage, install `xvfb`, `ffmpeg`,
+`imagemagick`, `xdotool`, `x11-utils`, `x11-xserver-utils`, and `x11-apps`, then run
+`MAREY_NATIVE_TESTS=1 node --test test/native-capture.test.mjs`. It creates and
+cleans up its own display. CI runs it separately from the portable tests.
 
 ---
 

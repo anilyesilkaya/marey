@@ -18,3 +18,15 @@ jobs:
         with:
           node-version: ${{ matrix.node }}
       - run: npm test
+
+  native-x11:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: sudo apt-get update && sudo apt-get install -y xvfb ffmpeg imagemagick xdotool x11-utils x11-xserver-utils x11-apps
+      - run: node --test test/native-capture.test.mjs
+        env:
+          MAREY_NATIVE_TESTS: "1"

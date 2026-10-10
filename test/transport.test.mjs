@@ -13,6 +13,9 @@ import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import os from 'node:os';
+import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { tinyPng } from './helpers.mjs';
 
 import { StdioServer } from '../src/jsonrpc.mjs';
 
@@ -161,6 +164,8 @@ test('end-to-end: initialize, tools/list, and a failing tool returns isError', a
     assert.ok(names.includes('status'), 'status tool should be available');
     assert.ok(names.includes('observe'), 'observe tool should be available');
     assert.ok(names.includes('replay'), 'replay tool should be available');
+    assert.ok(names.includes('get_frames'), 'time-range inspection should be available');
+    assert.equal(list.result.tools.find((t) => t.name === 'record').outputSchema, undefined, 'legacy clients receive their supported schema');
 
     // stop_recording with nothing in progress is a TOOL failure → isError:true,
     // NOT a JSON-RPC protocol error.
@@ -178,6 +183,9 @@ test('end-to-end: initialize, tools/list, and a failing tool returns isError', a
     assert.ok(unknown.error, 'unknown tool is a protocol error');
     assert.equal(unknown.error.code, -32602);
 
+    const malformed = await srv.rpc(7, 'tools/call', { name: 'capture', arguments: [] });
+    assert.equal(malformed.error.code, -32602, 'malformed arguments must not silently capture the default desktop');
+
     // status reports no active recording.
     const st = await srv.rpc(6, 'tools/call', { name: 'status', arguments: {} });
     assert.equal(st.result.isError, undefined);
@@ -185,6 +193,31 @@ test('end-to-end: initialize, tools/list, and a failing tool returns isError', a
   } finally {
     srv.close();
   }
+});
+
+test('modern MCP negotiates structured evidence and time-range image results', async (t) => {
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'marey-mcp-evidence-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const quality = { status: 'degraded', gaps: [{ startMs: 0, endMs: 500 }], gapCount: 1 };
+  await writeFile(path.join(dir, 'frame.png'), tinyPng());
+  await writeFile(path.join(dir, 'manifest.json'), JSON.stringify({ manifestVersion: 1, quality,
+    target: { region: 'window', windowId: '123' }, frames: [{ index: 1, timeMs: 500, file: 'frame.png' }] }));
+  const srv = startServerProcess();
+  try {
+    const init = await srv.rpc(1, 'initialize', { protocolVersion: '2025-11-25' });
+    assert.equal(init.result.protocolVersion, '2025-11-25');
+    const list = await srv.rpc(2, 'tools/list', {});
+    const record = list.result.tools.find((t) => t.name === 'record');
+    assert.ok(record.outputSchema.required.includes('quality'));
+    assert.ok(record.inputSchema.properties.windowId);
+    assert.ok(record.inputSchema.properties.rect);
+    const response = await srv.rpc(3, 'tools/call', { name: 'get_frames', arguments: { dir, startMs: 400, endMs: 600 } });
+    assert.equal(response.result.isError, undefined);
+    assert.deepEqual(response.result.structuredContent.quality, quality);
+    assert.equal(response.result.structuredContent.frames[0].timeMs, 500);
+    assert.equal(response.result.content[0].type, 'image');
+    assert.match(response.result.content[1].text, /degraded/);
+  } finally { srv.close(); }
 });
 
 test('end-to-end: malformed JSON and garbage do not crash the server', async () => {

@@ -31,6 +31,7 @@ import { createDefaultBackend, pngDimensions } from './capture.mjs';
 import { decodePng, encodePng } from './png.mjs';
 import { composeWithinBudget } from './contactsheet.mjs';
 import { grayscaleSignature, signatureDiff } from './image.mjs';
+import { captureRect } from './capture-target.mjs';
 
 export const MANIFEST_VERSION = 1;
 
@@ -43,7 +44,6 @@ export const DEFAULT_LIMITS = {
   maxDiskBytes: 2 * 1024 ** 3,// cap on total bytes written for a session (2 GiB)
   maxInputPixels: 8192 * 8192,// reject an absurdly large source frame
   maxComposeFrames: 36,       // cap on cells composed into one contact sheet
-  maxAnalysisFrames: 240,     // cap on frames DECODED to choose cells (bounds cost)
   maxOutputPixels: 24_000_000,// cap on the composed contact-sheet pixel count
   maxOutputBytes: 3_500_000,  // cap on encoded sheet bytes (≈4.8 MB base64, under
                               // the ~5 MB inline-image limit most MCP clients enforce)
@@ -129,6 +129,7 @@ export class SessionController {
       dir: s.dir,
       frameCount: s.committedCount(),
       fps: s.fps,
+      target: s.target || s.stream?.target || null,
       region: s.region,
       title: s.title,
       startedAt: s.startedWall ? s.startedWall.toISOString() : null,
@@ -156,7 +157,7 @@ export class SessionController {
       );
     }
 
-    const fps = clampNumber(opts.fps, 2, 0.1, 60);
+    const fps = clampNumber(opts.fps, 15, 0.1, 60);
     const region = opts.region || 'primary';
     const title = opts.title || null;
     const detail = normalizeDetail(opts.detail);
@@ -195,7 +196,7 @@ export class SessionController {
     const session = {
       id, dir, baseDir: this.baseDir,
       state: STATES.STARTING,
-      region, title, fps, intervalMs, detail, cols, thumbWidth,
+      region, title, windowId: opts.windowId, rect: captureRect(opts.rect), fps, intervalMs, detail, cols, thumbWidth,
       timed, durationMs, deadlineMs,
       replay, replayWindowMs,
       clips: [],           // replay markers → { markIndex, markedAtMs, frames[] }
@@ -237,6 +238,7 @@ export class SessionController {
         state: session.state,
         ready: session.state === STATES.RECORDING,
         region, title, fps, detail,
+        target: session.target || session.stream?.target || null,
         startedAt: startedWall.toISOString(),
         backend: this.backend.name,
         timed,
@@ -293,7 +295,7 @@ export class SessionController {
       }, this.limits.startupTimeoutMs);
 
       session.stream = this.backend.startStream(
-        { region: session.region, title: session.title, intervalMs: session.intervalMs },
+        { region: session.region, title: session.title, windowId: session.windowId, rect: session.rect, intervalMs: session.intervalMs },
         (frame, count) => this._onFrame(session, frame, count),
       );
 
@@ -362,12 +364,42 @@ export class SessionController {
       return;
     }
 
+    if (!Number.isFinite(frame.timeMs) || frame.timeMs < 0 ||
+        (session.lastAcquisitionMs != null && frame.timeMs < session.lastAcquisitionMs)) {
+      session.droppedInvalidTimestamp = (session.droppedInvalidTimestamp || 0) + 1;
+      if (session.droppedInvalidTimestamp === 1) session.warnings.push('Dropped frame(s) with invalid or decreasing acquisition timestamps.');
+      return;
+    }
+    if (frame.target) session.target = frame.target;
+    const target = session.target || session.stream?.target;
+    if (target && !target.bounds) target.bounds = { x: target.rect?.x || 0, y: target.rect?.y || 0, width: dims.width, height: dims.height };
+    if (target && (target.bounds.width !== dims.width || target.bounds.height !== dims.height) && !session.geometryChanged) {
+      session.geometryChanged = true;
+      session.warnings.push('Capture dimensions changed during recording; resolved bounds refer to startup, and each frame reports its actual dimensions.');
+    }
+    session.timingSource ||= frame.timingSource;
+
     // A valid frame has been acquired → the session is READY. Signalled here,
     // on acquisition, independent of whether this frame's disk write succeeds.
     session._firstFrameSeen = true;
     session._markReady && session._markReady();
 
     const index = ++session.frameSeq;
+    if (session.firstAcquisitionMs == null) session.firstAcquisitionMs = frame.timeMs;
+    if (session.lastAcquisitionMs != null) {
+      const gap = frame.timeMs - session.lastAcquisitionMs;
+      session.spacingSum = (session.spacingSum || 0) + gap;
+      session.maxObservedGap = Math.max(session.maxObservedGap || 0, gap);
+      if (gap > session.intervalMs * 1.5) {
+        session.gapCount = (session.gapCount || 0) + 1;
+        session.captureGaps ||= [];
+        session.captureGaps.push({ afterIndex: index - 1, beforeIndex: index,
+          startMs: session.lastAcquisitionMs, endMs: frame.timeMs, durationMs: gap });
+        if (session.captureGaps.length > 240) session.captureGaps.shift();
+      }
+    }
+    session.lastAcquisitionMs = frame.timeMs;
+    session.acquiredFrames = (session.acquiredFrames || 0) + 1;
     const name = `frame_${String(index).padStart(3, '0')}_${String(Math.round(frame.timeMs)).padStart(5, '0')}ms.png`;
     const framePath = path.join(session.dir, name);
     const entry = {
@@ -560,6 +592,7 @@ export class SessionController {
   _finalise(session, terminalState, reason) {
     if (session.finalisePromise) return session.finalisePromise;
 
+    session.stoppedMono = this.clock.now();
     session.finalisePromise = (async () => {
       session.state = STATES.FINALISING;
       if (session.deadlineTimer) this.clock.clearTimeout(session.deadlineTimer);
@@ -634,7 +667,10 @@ export class SessionController {
       session.result = result;
 
       await this._writeManifest(session, { reason, result }).catch((e) => {
-        session.warnings.push(`Manifest write failed: ${e.message}`);
+        const warning = `Manifest write failed: ${e.message}`;
+        session.warnings.push(warning);
+        result.warnings.push(warning);
+        result.quality.status = 'degraded';
       });
 
       // Release the guard and remember the result for later retrieval.
@@ -684,14 +720,14 @@ export class SessionController {
       // Decode a bounded candidate set to measure frame-to-frame change, then
       // choose the most informative cells. Pixels are discarded after the tiny
       // signatures (bounded memory); selected frames are re-read below.
-      const analysed = pool.length > this.limits.maxAnalysisFrames
-        ? evenSample(pool, this.limits.maxAnalysisFrames)
-        : pool;
+      // Examine every stored frame sequentially. Evenly thinning the analysis
+      // candidates could discard the single frame containing a brief glitch.
+      const analysed = pool;
       const { entries, sigs } = await this._signaturesFor(analysed);
       selected = entries.length > maxCells ? selectByChange(entries, sigs, maxCells) : entries;
       selectionNote =
         `Shows ${selected.length} of ${pool.length} frames ` +
-        `(selected by visual change); all frames remain on disk (use get_frame).`;
+        `(selected by visual change with transition context); all frames remain on disk (use get_frames for a time range).`;
     }
 
     // --- 2. decode the selected frames for composition ----------------------
@@ -710,11 +746,13 @@ export class SessionController {
     }
 
     // --- 3. fit within the output budget (pixels + measured bytes) ----------
+    const signatures = new Map(frames.map((f) => [f.index, grayscaleSignature(f.image)]));
     const built = composeWithinBudget(frames, {
       cols: session.cols,
       thumbWidth: session.thumbWidth,
       maxPixels: this.limits.maxOutputPixels,
       maxBytes,
+      selectFrames: (pool, count) => selectByChange(pool, pool.map((f) => signatures.get(f.index)), count),
       encode: (img) => encodePng(img.width, img.height, img.data),
     });
 
@@ -818,14 +856,18 @@ export class SessionController {
 
   _buildResult(session, committed, extra) {
     const actualSeconds = extra.elapsedMs / 1000;
-    const spacings = [];
-    for (let i = 1; i < committed.length; i++) {
-      spacings.push(committed[i].timeMs - committed[i - 1].timeMs);
-    }
-    const meanSpacing = spacings.length
-      ? spacings.reduce((a, b) => a + b, 0) / spacings.length : null;
-    const maxGap = spacings.length ? Math.max(...spacings) : null;
-    const actualFps = actualSeconds > 0 ? committed.length / actualSeconds : null;
+    const intervals = (session.acquiredFrames || 0) - 1;
+    const meanSpacing = intervals > 0 ? session.spacingSum / intervals : null;
+    const maxGap = intervals > 0 ? session.maxObservedGap : null;
+    const spanMs = intervals > 0 ? session.lastAcquisitionMs - session.firstAcquisitionMs : 0;
+    const actualFps = spanMs > 0 ? intervals * 1000 / spanMs : null;
+    const warnings = [...session.warnings, ...(session.stream?.warnings || [])];
+    const target = session.target || session.stream?.target || { region: session.region, windowId: session.windowId || null, title: session.title, rect: session.rect };
+    const timingSource = session.timingSource || session.stream?.timingSource || 'backend-clock';
+    const gaps = session.captureGaps || [];
+    if (actualFps != null && actualFps < session.fps * 0.8) warnings.push(`Achieved ${actualFps.toFixed(2)} fps versus requested ${session.fps} fps; brief events may be missing.`);
+    if (session.gapCount) warnings.push(`${session.gapCount} capture gap(s) exceeded 1.5 times the requested interval; largest gap ${maxGap.toFixed(1)}ms.`);
+    const degraded = session.state !== STATES.COMPLETED || warnings.length > 0 || session.errors.length > 0;
 
     return {
       sessionId: session.id,
@@ -833,14 +875,21 @@ export class SessionController {
       completionReason: extra.reason,
       dir: session.dir,
       manifestPath: path.join(session.dir, 'manifest.json'),
-      backend: this.backend.name,
+      backend: session.stream?.backend || this.backend.name,
+      target, timingSource,
       frameCount: committed.length,
       // Requested vs actual timing, reported separately (never conflated).
       fps: session.fps,
-      requested: { seconds: session.timed ? session.durationMs / 1000 : null, fps: session.fps },
+      requested: { seconds: session.timed ? session.durationMs / 1000 : null, fps: session.fps,
+        target: { region: session.region, title: session.title, windowId: session.windowId || null, rect: session.rect } },
       actual: {
         seconds: actualSeconds,
         fps: actualFps,
+        captureSpanSeconds: spanMs / 1000,
+        firstFrameMs: session.firstAcquisitionMs ?? null,
+        lastFrameMs: session.lastAcquisitionMs ?? null,
+        acquiredFrames: session.acquiredFrames || 0,
+        recordingWindowSeconds: session.recordingStartMono == null ? 0 : ((session.stoppedMono ?? this.clock.now()) - session.recordingStartMono) / 1000,
         meanFrameSpacingMs: meanSpacing,
         maxFrameGapMs: maxGap,
       },
@@ -856,11 +905,15 @@ export class SessionController {
       composedFrames: extra.contactSheet ? extra.contactSheet.composedFrames : null,
       detail: session.detail,
       capped: !!session._cappedFrames || !!session._cappedDisk,
-      warnings: session.warnings.slice(),
+      warnings,
+      quality: { status: degraded ? 'degraded' : 'complete', gaps, gapCount: session.gapCount || 0,
+        gapsTruncated: (session.gapCount || 0) > gaps.length,
+        droppedFrames: (session.droppedUndecodable || 0) + (session.droppedOversized || 0) + (session.droppedInvalidTimestamp || 0),
+        briefEventsMayBeMissed: true },
       errors: session.errors.slice(),
       contactSheetPath: extra.contactSheetPath,
       latestPath: extra.latestPath,
-      frames: committed.map((f) => ({ path: f.path, index: f.index, timeMs: f.timeMs })),
+      frames: committed.map((f) => ({ path: f.path, index: f.index, timeMs: f.timeMs, width: f.width, height: f.height })),
       contactSheet: extra.contactSheet,
       // Replay (Phase 4): per-marker clips, each with its own contact sheet. Null
       // for a normal (non-replay) recording. The first clip's sheet is mirrored
@@ -882,7 +935,10 @@ export class SessionController {
       sessionId: session.id,
       state: session.state,
       backend: this.backend.name,
-      target: { requestedRegion: session.region, title: session.title },
+      target: { requestedRegion: session.region, ...(extra.result?.target || session.target || session.stream?.target || { title: session.title, windowId: session.windowId || null, rect: session.rect }) },
+      actual: extra.result?.actual || null,
+      quality: extra.result?.quality || null,
+      timingSource: extra.result?.timingSource || session.timingSource || null,
       capture: {
         fps: session.fps,
         intervalMs: session.intervalMs,
@@ -899,7 +955,7 @@ export class SessionController {
       frames: session.frames
         .filter((f) => f.written)
         .map((f) => ({ index: f.index, timeMs: f.timeMs, bytes: f.bytes, width: f.width, height: f.height, file: path.basename(f.path) })),
-      warnings: session.warnings,
+      warnings: extra.result?.warnings || session.warnings,
       errors: session.errors,
       completionReason: extra.reason || null,
     };
@@ -969,9 +1025,9 @@ export class SessionController {
   }
 }
 
-// Select `count` frames preferring those with the most visual CHANGE from the
-// previous frame, always keeping the first and last and preserving temporal
-// order. `entries` and `sigs` are aligned (sigs[i] is entries[i]'s signature).
+// Select transition neighborhoods in temporal order. Keep distant endpoints
+// when the budget allows; tiny sheets prioritize immediate before/after context.
+// `entries` and `sigs` are aligned (sigs[i] is entries[i]'s signature).
 //
 // Rationale: a recording of a bug has long static stretches and a few moments
 // where something actually happens (a flash, a reorder, a drag landing). Even
@@ -979,34 +1035,34 @@ export class SessionController {
 // transitions, which is what the agent needs to see. Falls back to even
 // sampling when there is no change signal or signatures are unavailable.
 function selectByChange(entries, sigs, count) {
+  count = Math.max(1, Math.floor(count));
   const n = entries.length;
   if (n <= count) return entries.slice();
-  if (count < 2 || sigs.length !== n) return evenSample(entries, count);
-
-  // Per-frame change: how much each frame differs from the one before it. The
-  // first frame has no predecessor (change 0); it is kept explicitly below.
-  const change = new Array(n).fill(0);
-  let total = 0;
-  for (let i = 1; i < n; i++) {
-    change[i] = signatureDiff(sigs[i], sigs[i - 1]);
-    total += change[i];
+  if (sigs.length !== n) return evenSample(entries, count);
+  const ranked = [];
+  for (let i = 1; i < n; i++) ranked.push({ i, score: signatureDiff(sigs[i], sigs[i - 1]) });
+  ranked.sort((a, b) => b.score - a.score || a.i - b.i);
+  if (!ranked[0]?.score) return evenSample(entries, count);
+  // With a tiny budget, evidence around the strongest transition takes
+  // precedence over distant first/last frames. Larger sheets retain both ends.
+  const keep = new Set(count >= 4 ? [0, n - 1] : []);
+  for (const { i, score } of ranked) {
+    if (!score || keep.size >= count) break;
+    // Reserve the BEFORE + changed frame as a pair, then the following frame.
+    const pair = [i - 1, i].filter((j) => !keep.has(j));
+    if (pair.length > count - keep.size) continue;
+    pair.forEach((j) => keep.add(j));
+    if (i + 1 < n && keep.size < count) keep.add(i + 1);
   }
-  // Nothing changed across the whole recording → no signal; sample by time.
-  if (total === 0) return evenSample(entries, count);
-
-  // Keep first + last; fill remaining slots with the highest-change interior
-  // frames (ties → earliest index, for determinism). Restore temporal order.
-  const keep = new Set([0, n - 1]);
-  const interior = [];
-  for (let i = 1; i < n - 1; i++) interior.push(i);
-  interior.sort((a, b) => (change[b] - change[a]) || (a - b));
-  for (let k = 0; k < interior.length && keep.size < count; k++) keep.add(interior[k]);
+  // Count=1, or an odd spare cell: retain the highest-scoring changed frame.
+  for (const { i } of ranked) { if (keep.size >= count) break; keep.add(i); }
   return [...keep].sort((a, b) => a - b).map((i) => entries[i]);
 }
 
 // Evenly sample `count` items from `arr`, always keeping the first and last.
 function evenSample(arr, count) {
   if (arr.length <= count) return arr.slice();
+  if (count <= 1) return arr.slice(0, 1);
   const out = [];
   const step = (arr.length - 1) / (count - 1);
   for (let i = 0; i < count; i++) out.push(arr[Math.round(i * step)]);

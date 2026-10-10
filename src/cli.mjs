@@ -15,7 +15,8 @@
 //   node src/cli.mjs doctor    (diagnose capture capability on this machine)
 
 import os from 'node:os';
-import { record, capture, getFrame, startRecording, stopRecording, observe, replay } from './recorder.mjs';
+import { record, capture, getFrame, getFrames, startRecording, stopRecording, observe, replay } from './recorder.mjs';
+import { evidenceSummary } from './evidence.mjs';
 import { listWindows, detectBackend, captureCapabilities, captureFrame } from './capture.mjs';
 import { signalControl, readControlRegistry } from './control.mjs';
 
@@ -60,6 +61,10 @@ function parseArgs(argv) {
       }
     }
   }
+  if (out['window-id'] != null) out.windowId = String(out['window-id']);
+  if (['rect-x', 'rect-y', 'rect-w', 'rect-h'].some((k) => k in out)) {
+    out.rect = { x: out['rect-x'], y: out['rect-y'], w: out['rect-w'], h: out['rect-h'] };
+  }
   return out;
 }
 
@@ -73,6 +78,7 @@ async function main() {
       console.log(`Recorded ${r.frameCount} frames in ${(r.elapsedMs / 1000).toFixed(2)}s`);
       console.log(`Contact sheet: ${r.contactSheetPath}`);
       console.log(`Frames dir:    ${r.dir}`);
+      console.log(evidenceSummary(r));
       break;
     }
     case 'capture': {
@@ -92,6 +98,16 @@ async function main() {
       } else {
         console.log(`Frame ${r.width}×${r.height} (full resolution) → ${r.path}`);
       }
+      break;
+    }
+    case 'get-frames': {
+      const r = await getFrames({ ...args, startMs: args['start-ms'], endMs: args['end-ms'], maxFrames: args['max-frames'], crop: buildCropArg(args) });
+      const { writeFile } = await import('node:fs/promises');
+      if (!args.out) throw new Error('get-frames requires --out <sheet.png>');
+      await writeFile(args.out, r.image.buffer);
+      console.log(`Showing ${r.frames.length} of ${r.availableFrames} frames → ${args.out}`);
+      console.log(r.frames.map((f) => `#${f.index} @ ${f.timeMs.toFixed(1)}ms`).join('\n'));
+      for (const warning of r.warnings) console.log(`Warning: ${warning}`);
       break;
     }
     case 'session': {
@@ -133,6 +149,7 @@ async function main() {
       console.log(`Observation ${how}: ${result.frameCount} frames over ${result.seconds.toFixed(2)}s`);
       console.log(`Contact sheet: ${result.contactSheetPath}`);
       console.log(`Frames dir:    ${result.dir}`);
+      console.log(evidenceSummary(result));
       break;
     }
     case 'replay': {
@@ -157,6 +174,7 @@ async function main() {
         console.log(`  Clip ${i + 1} (marker #${c.markIndex}): ${c.frameCount} frames → ${c.contactSheetPath}`);
       });
       console.log(`Frames dir: ${result.dir}`);
+      console.log(evidenceSummary(result));
       break;
     }
     case 'mark': {
@@ -209,7 +227,7 @@ async function main() {
       break;
     }
     default:
-      console.log('Usage: marey <record|observe|replay|session|capture|get-frame|mark|finish|windows|backend|doctor> [--flags]');
+      console.log('Usage: marey <record|observe|replay|session|capture|get-frame|get-frames|mark|finish|windows|backend|doctor> [--flags]');
       process.exit(command ? 1 : 0);
   }
 }
@@ -229,6 +247,7 @@ async function runDoctor() {
     console.log(`Backend:      ${caps.backend}`);
     console.log(`Regions:      ${caps.regions.join(', ')}`);
     console.log(`Window grab:  ${caps.windowCapture ? 'yes' : 'no (primary/virtual only)'}`);
+    console.log(`Continuous:   ${caps.continuousCapture ? 'available (verify achieved FPS with record)' : 'single-frame fallback; short events may be missed'}`);
   } catch (err) {
     console.log(`Backend:      detection failed: ${err.message}`);
   }
@@ -238,7 +257,7 @@ async function runDoctor() {
   process.stdout.write('Capture probe: ');
   try {
     const t0 = Date.now();
-    const img = await captureFrame({ region: 'primary' });
+    const img = await captureFrame({ region: caps?.regions.includes('primary') ? 'primary' : caps?.regions[0] || 'primary' });
     const ms = Date.now() - t0;
     probeOk = img && img.width > 0 && img.height > 0;
     console.log(probeOk

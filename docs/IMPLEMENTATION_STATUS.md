@@ -2,7 +2,8 @@
 
 Working branch: `session-reliability`. Baseline reviewed: `a753847`.
 Baseline test suite: 13/13 passing on Node 24 / Windows 11 (this machine).
-Current test suite: 82/82 passing on Node 24 / Windows 11 (through Phase 4).
+Phase 4 checkpoint: 82/82 passing on Node 24 / Windows 11.
+Phase 5 validation: 99 portable tests pass, plus the opt-in real X11 regression; see below.
 
 This document tracks what is **done + verified**, **done but unverified**, and
 **deferred**, so the work can be resumed. Keep it honest: a fake-backend test
@@ -260,4 +261,54 @@ selection logic are inherited unchanged from Phase 3.
 
 ## Phase 5 — temporal fidelity + agent-driven capture
 
-Status: not started.
+Status: implemented; validated on Linux/X11 (Node 24.19, FFmpeg 7.1.5).
+Windows/macOS native changes remain unverified on their actual platforms.
+
+Implemented:
+
+- Continuous FFmpeg X11 and optional macOS AVFoundation capture. PNGs are
+  paired with acquisition PTS across independent stdout/stderr delivery;
+  probe/output buffering is minimized and shutdown is bounded. Windows retains
+  its existing PowerShell stream. Native-command fallback skips missed scheduling
+  slots and timestamps capture start, with its limitation reported explicitly.
+- Recording-time target-relative `rect`, stable `windowId`, visible-window
+  selection, ambiguity rejection, and resolved bounds. Linux uses xdotool +
+  xwininfo for discovery/hidden-state validation; xrandr identifies primary
+  monitor bounds when available. Linux window capture remains occlusion-dependent.
+- ImageMagick normalization to 8-bit, non-interlaced RGB for blank/monochrome
+  captures. Unsupported macOS virtual scope and Wayland primary/window scopes
+  fail explicitly; Wayland can capture a virtual desktop or explicit rectangle.
+- Acquisition telemetry: requested/achieved FPS, mean/max spacing, bounded gap
+  details, completion reason, warnings/errors, and source target. Replay eviction
+  does not manufacture acquisition gaps. Newer MCP protocols receive structured
+  results; legacy clients keep a text fallback. Failed recordings retain images
+  with `isError:true`; stop retrieves an automatically finalized open session.
+- Transition before/changed/following selection, including when the output
+  budget reduces cells. Sequential analysis covers every recorded frame instead
+  of discarding candidates by preliminary time sampling.
+- `get_frames` and CLI `get-frames` for cropped time-range contact sheets, with
+  selected timestamps, source quality, and unreadable-frame reporting.
+- Default target rate changed from 2 to 15 fps; documentation and bundled agent
+  skill now describe all ten tools and the quality/targeting workflow.
+
+Validation:
+
+- `npm test`: 99 passed, 0 failed; the opt-in native test is skipped in this run.
+  Includes fragmented PNG transport, timestamp pairing, fallback scheduling,
+  target/rectangle validation, partial failures, manifest quality persistence,
+  replay telemetry, time-range retrieval, newer/legacy MCP compatibility, and
+  single-frame flash selection in a 400-frame recording.
+- `MAREY_NATIVE_TESTS=1 node --test test/native-capture.test.mjs`: 1 passed, 0
+  skipped. Uses its own Xvfb display and the real binaries (without the cloud
+  setup's ImageMagick wrapper). Captures a 100ms flash, checks blank-screen PNGs,
+  cropped dimensions, ambiguous/hidden targets, and end-to-end MCP quality.
+  Unmapping a live target returns failed evidence with retained image data.
+- Manual 320×240 continuous capture: 21 frames over 1.00s, achieved 20.00fps,
+  largest gap 50ms. This demonstrates one configuration, not a guarantee for
+  arbitrary screen sizes or hosts.
+- Added a native X11 CI job. Its hosted execution is not yet observed here.
+- Isolated observe/replay test-worker temp registries after full-suite execution
+  exposed an existing race through their shared OS temporary registry filename.
+
+Still outside this phase: interaction-event logging, browser DOM/network/console
+integration, reproducible before/after scenarios, and LLM diagnosis benchmarks.

@@ -5,7 +5,7 @@
 // the recording, cross-process marking (what `marey mark` does), and the full
 // arm → mark (twice) → finish → two clips round-trip.
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { SessionController } from '../src/session.mjs';
@@ -14,7 +14,9 @@ import {
   createControlServer, writeControlRegistry, clearControlRegistry,
   readControlRegistry, signalControl,
 } from '../src/control.mjs';
-import { createMemoryFs, tinyPng } from './helpers.mjs';
+import { createMemoryFs, tinyPng, isolateControlRegistry } from './helpers.mjs';
+
+after(isolateControlRegistry());
 
 // A real-timer fake backend: emits a tiny frame every intervalMs via real
 // setTimeout, so a real-clock replay session buffers frames deterministically

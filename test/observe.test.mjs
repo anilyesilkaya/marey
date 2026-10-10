@@ -4,7 +4,7 @@
 // Finish/Cancel is driven two ways: via signalControl() (what `marey finish`
 // does from another process) and via the control-server outcome directly.
 
-import { test } from 'node:test';
+import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
 import os from 'node:os';
@@ -16,7 +16,9 @@ import {
   createControlServer, writeControlRegistry, clearControlRegistry,
   readControlRegistry, signalControl,
 } from '../src/control.mjs';
-import { createMemoryFs, tinyPng } from './helpers.mjs';
+import { createMemoryFs, tinyPng, isolateControlRegistry } from './helpers.mjs';
+
+after(isolateControlRegistry());
 
 // A real-timer fake backend: emits a tiny frame every intervalMs via real
 // setTimeout, so observe()'s real-clock session captures frames deterministically

@@ -63,13 +63,13 @@ Prefer a specific window when possible.
 ## Temporal visual inspection
 
 1. If the relevant window is not known, call `list_windows`.
-2. Select the target using a distinctive substring of its title.
-3. Call `record`.
+2. Select a visible, non-minimized window by its stable `windowId`. A title is a fallback and must be unambiguous.
+3. Call `record`; use `rect: {x,y,w,h}` to restrict recording to the relevant area if possible.
 4. Inspect the returned contact sheet.
-5. Compare frames in chronological order.
+5. Check the quality summary first: achieved FPS, capture gaps, warnings, errors, and completion reason. A partial/failed recording can still contain useful evidence. Compare frames in chronological order.
 6. Refer to both **frame numbers and timestamps** when describing a change.
 7. If one transition needs closer inspection, inspect the corresponding
-   full-resolution raw frames before making another recording.
+   neighborhood with `get_frames {dir,startMs,endMs,maxFrames}` and fetch a cropped full-resolution raw frame with `get_frame` before making another recording.
 
 Do not infer exact timing from frame numbers or requested FPS. Use the timestamp
 shown on each frame because FPS is only a target.
@@ -102,7 +102,7 @@ detail: "high"
 
 ```text
 seconds: 2
-fps: 6
+fps: 20
 ```
 
 ### Many frames at a glance (coarse motion, no fine detail)
@@ -145,7 +145,7 @@ Then record using:
 
 ```text
 region: "window"
-title: "<distinctive window-title substring>"
+windowId: "<visible window ID from list_windows>"
 ```
 
 Example:
@@ -169,7 +169,7 @@ Prefer window capture because it:
 
 # Coordinating an interaction
 
-When the behavior must be triggered manually, choose between two timing models:
+When the user wants to demonstrate a bug, prefer `observe`; for an intermittent glitch, prefer `replay`. Announce the interaction and Finish/Mark controls before calling these blocking tools. For agent-controlled timing, use the following alternatives:
 
 ## Fixed duration (`record` + `delay`)
 
@@ -238,7 +238,7 @@ Do this before re-recording unless the event itself was missed.
 
 # Available MCP tools
 
-Marey exposes six tools.
+Marey exposes ten tools.
 
 | Tool | Use |
 | --- | --- |
@@ -247,7 +247,11 @@ Marey exposes six tools.
 | `stop_recording` | Stop the open-ended recording and return the contact sheet |
 | `capture` | Capture one screenshot |
 | `get_frame` | Fetch one frame from a recording at full resolution |
-| `list_windows` | Discover windows that can be targeted |
+| `list_windows` | Discover IDs, bounds, and hidden state; prefer exact IDs |
+| `observe` | Record until the user clicks Finish |
+| `replay` | Keep a rolling buffer; user marks glitches then finishes |
+| `status` | Inspect recording state |
+| `get_frames` | Inspect a time range as a contact sheet, optionally cropped |
 
 ## `record`
 
@@ -256,9 +260,11 @@ Parameters:
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `seconds` | `5` | Recording duration, 0.1–120 seconds |
-| `fps` | `2` | Target frames per second, 0.1–60 |
+| `fps` | `15` | Target frames per second, 0.1–60 |
 | `region` | `primary` | `primary`, `virtual`, or `window` |
-| `title` | — | Window-title substring required for `window` |
+| `title` | — | Unambiguous title substring, an alternative to `windowId` |
+| `windowId` | — | Stable native ID from `list_windows` |
+| `rect` | — | Integer `{x,y,w,h}` in target-relative pixels, applied during recording |
 | `delay` | `0` | Delay before recording starts |
 | `detail` | `overview` | Legibility preset: `overview`, `high`, or `max` |
 | `cols` | `4` | Contact-sheet columns (overrides `detail`) |
@@ -267,7 +273,7 @@ Parameters:
 ## `start_recording`
 
 Takes the same parameters as `record` **except `seconds`** (the recording runs
-until `stop_recording`): `fps`, `region`, `title`, `delay`, `detail`, `cols`,
+until `stop_recording`): `fps`, `region`, `title`/`windowId`, `rect`, `delay`, `detail`, `cols`,
 `thumbWidth`. Only one recording can be active at a time.
 
 ## `stop_recording`
@@ -286,7 +292,11 @@ a frame number, or a direct frame path.
 | `index` | — | 1-based frame number (required with `dir`) |
 | `path` | — | Direct path to a frame PNG (alternative to `dir` + `index`) |
 
-`capture` supports `region`, `title`, and `delay`.
+`capture` supports `region`, `title`/`windowId`, `rect`, and `delay`.
+
+`get_frames` requires `dir`; `startMs`/`endMs` specify inclusive acquisition milliseconds, `maxFrames` is 2–36 (default 12), and `crop` uses the same format as `get_frame`. It retains before/changed/following context and reports absent/unreadable frames.
+
+Read `quality`, `actual`, `warnings`, `errors`, `completionReason`, and `target` from structured results when available. Older clients receive a text fallback. Never claim that an event did not happen inside a capture gap. A degraded result is useful partial evidence, not a clean reproduction.
 
 `list_windows` takes no arguments.
 
@@ -306,7 +316,7 @@ Capture backends are auto-detected:
 - **Linux Wayland:** `grim`
 - **macOS:** built-in `screencapture`
 
-Window capture on Linux requires the appropriate backend support.
+Continuous X11 capture requires FFmpeg and xdotool; window listing/validation also requires xwininfo. macOS continuous capture requires FFmpeg AVFoundation and Screen Recording permission. Wayland uses a slower native-command fallback; use region:"virtual" or a rect. macOS virtual-desktop/window capture is unsupported.
 
 ## Verify the capture backend
 
@@ -349,7 +359,11 @@ start_recording
 stop_recording
 capture
 get_frame
+get_frames
 list_windows
+observe
+replay
+status
 ```
 
 Alternatively, install the Claude Code plugin, which bundles this skill and the
@@ -389,8 +403,7 @@ Install a supported capture backend.
 
 ### Window cannot be found
 
-Run `list_windows` again and choose a distinctive substring from the current
-window title.
+Run `list_windows` again and select a visible window ID. An ambiguous title requires an ID; hidden/minimized targets are rejected.
 
 The window must be visible and non-minimized.
 
@@ -439,5 +452,9 @@ start_recording
 stop_recording
 capture
 get_frame
+get_frames
 list_windows
+observe
+replay
+status
 ```

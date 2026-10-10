@@ -242,7 +242,7 @@ test('getFrame without a crop returns the original bytes untouched', async () =>
 
 // --- Phase 3: content-aware frame selection --------------------------------
 
-test('selectByChange keeps first + last and the highest-change interior frames', () => {
+test('selectByChange reserves the immediate before frame for the strongest transition', () => {
   // 6 frames; frames 2 and 4 (0-based) differ sharply from their predecessor,
   // the rest are near-static. Signatures are 1-pixel grayscale for clarity.
   const entries = Array.from({ length: 6 }, (_, i) => ({ index: i + 1, timeMs: i * 100 }));
@@ -256,8 +256,8 @@ test('selectByChange keeps first + last and the highest-change interior frames',
   ];
   const picked = selectByChange(entries, sigs, 4);
   const idxs = picked.map((e) => e.index);
-  // First (1) and last (6) always kept; the two biggest changes are #3 and #5.
-  assert.deepEqual(idxs, [1, 3, 5, 6]);
+  // A four-cell budget keeps endpoints and #2→#3, rather than two isolated changes.
+  assert.deepEqual(idxs, [1, 2, 3, 6]);
   // Temporal order preserved.
   assert.deepEqual(idxs, [...idxs].sort((a, b) => a - b));
 });

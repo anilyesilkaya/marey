@@ -4,7 +4,23 @@
 // disk, no real screen capture.
 
 import path from 'node:path';
+import os from 'node:os';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { encodePng } from '../src/png.mjs';
+
+// Control-registry tests run in separate Node workers but otherwise share the
+// same OS temp directory. Give each worker its own real cross-process registry.
+export function isolateControlRegistry() {
+  const dir = mkdtempSync(path.join(os.tmpdir(), 'marey-test-control-'));
+  const previous = Object.fromEntries(['TMPDIR', 'TEMP', 'TMP'].map((k) => [k, process.env[k]]));
+  for (const key of Object.keys(previous)) process.env[key] = dir;
+  return () => {
+    for (const [key, value] of Object.entries(previous)) {
+      if (value == null) delete process.env[key]; else process.env[key] = value;
+    }
+    rmSync(dir, { recursive: true, force: true });
+  };
+}
 
 // --- in-memory filesystem (the subset SessionController uses) ---------------
 //

@@ -14,6 +14,9 @@ import { spawn, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import os from 'node:os';
 import { decodePng, pngDimensions } from './png.mjs';
+import { captureRect, selectWindow, TargetUnavailableError } from './capture-target.mjs';
+import { deferredStream, startFfmpegStream } from './capture-stream.mjs';
+export { TargetUnavailableError } from './capture-target.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -30,15 +33,18 @@ function which(cmd) {
 
 // Run a command and collect stdout as a Buffer (for backends that emit PNG
 // bytes to stdout).
-function runCapture(cmd, args, { input } = {}) {
+function runCapture(cmd, args, { input, signal } = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { windowsHide: true });
+    const child = spawn(cmd, args, { windowsHide: true, signal });
+    const timer = setTimeout(() => child.kill('SIGKILL'), 10000);
+    timer.unref?.();
     const chunks = [];
     const errChunks = [];
     child.stdout.on('data', (d) => chunks.push(d));
     child.stderr.on('data', (d) => errChunks.push(d));
     child.on('error', reject);
     child.on('close', (code) => {
+      clearTimeout(timer);
       if (code !== 0) {
         reject(new Error(`${cmd} exited ${code}: ${Buffer.concat(errChunks).toString('utf8').trim()}`));
         return;
@@ -54,13 +60,6 @@ function runCapture(cmd, args, { input } = {}) {
 
 // Error thrown when a requested target cannot be honoured on this backend.
 // The recorder surfaces this verbatim rather than silently broadening scope.
-export class TargetUnavailableError extends Error {
-  constructor(message) {
-    super(message);
-    this.name = 'TargetUnavailableError';
-  }
-}
-
 // --- Windows backend (PowerShell + System.Drawing) -------------------------
 
 // Shared PowerShell helpers for capture. Window capture uses PrintWindow with
@@ -90,7 +89,12 @@ public class ${className} {
 "@
 
 function Find-TargetWindow {
-  param($title)
+  param($title, $windowId)
+  if ($windowId) {
+    $handle = [IntPtr]([long]$windowId)
+    if (-not [${className}]::IsWindow($handle)) { throw "MAREY_TARGET:Window ID no longer exists" }
+    return $handle
+  }
   $proc = Get-Process | Where-Object { $_.MainWindowTitle -like "*$title*" -and $_.MainWindowHandle -ne 0 } | Select-Object -First 1
   if ($null -eq $proc) { throw "MAREY_TARGET:No window with a title matching '$title'" }
   return $proc.MainWindowHandle
@@ -132,11 +136,15 @@ function New-WindowBitmap {
 }
 
 function New-ScreenBitmap {
-  param($region)
+  param($region, $cropX=0, $cropY=0, $cropW=0, $cropH=0)
   if ($region -eq 'virtual') {
     $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
   } else {
     $b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds
+  }
+  if ($cropW -gt 0) {
+    if ($cropX + $cropW -gt $b.Width -or $cropY + $cropH -gt $b.Height) { throw "MAREY_TARGET:rect extends outside the capture target" }
+    $b = New-Object System.Drawing.Rectangle(($b.X + $cropX), ($b.Y + $cropY), $cropW, $cropH)
   }
   $bmp = New-Object System.Drawing.Bitmap($b.Width, $b.Height)
   $gfx = [System.Drawing.Graphics]::FromImage($bmp)
@@ -153,19 +161,30 @@ function psQuote(s) {
   return String(s == null ? '' : s).replace(/'/g, "''");
 }
 
-function windowsCaptureScript(region, title) {
+function psCropBitmap(rect, variable, disposeOriginal = true) {
+  if (!rect) return '';
+  return `
+if (${rect.x + rect.w} -gt ${variable}.Width -or ${rect.y + rect.h} -gt ${variable}.Height) { throw "MAREY_TARGET:rect extends outside the capture target" }
+$cropRect = New-Object System.Drawing.Rectangle(${rect.x}, ${rect.y}, ${rect.w}, ${rect.h})
+$cropped = ${variable}.Clone($cropRect, [System.Drawing.Imaging.PixelFormat]::Format24bppRgb)
+${disposeOriginal ? `${variable}.Dispose()` : ''}
+${variable} = $cropped`;
+}
+
+function windowsCaptureScript(region, title, windowId, rect) {
   return `
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
 ${psCaptureCommon('Win32Single')}
 if ('${psQuote(region)}' -eq 'window') {
-  $hwnd = Find-TargetWindow -title '${psQuote(title)}'
+  $hwnd = Find-TargetWindow -title '${psQuote(title)}' -windowId '${psQuote(windowId)}'
   Assert-Capturable $hwnd '${psQuote(title)}'
   $bmp = New-WindowBitmap $hwnd
 } else {
-  $bmp = New-ScreenBitmap -region '${psQuote(region)}'
+  $bmp = New-ScreenBitmap -region '${psQuote(region)}' ${rect ? `-cropX ${rect.x} -cropY ${rect.y} -cropW ${rect.w} -cropH ${rect.h}` : ''}
 }
+${psCropBitmap(region === 'window' ? rect : null, '$bmp')}
 $ms = New-Object System.IO.MemoryStream
 $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
 $bmp.Dispose()
@@ -173,8 +192,8 @@ $bmp.Dispose()
 `;
 }
 
-async function grabWindows({ region, title }) {
-  const script = windowsCaptureScript(region, title);
+async function grabWindows({ region, title, windowId, rect }) {
+  const script = windowsCaptureScript(region, title, windowId, rect);
   try {
     const { stdout } = await execFileAsync(
       'powershell.exe',
@@ -203,7 +222,7 @@ function mapTargetError(err, region) {
 // Scheduling targets intended capture times and SKIPS missed slots when the
 // backend falls behind (rather than firing a burst of catch-up frames), so a
 // slow host yields fewer, wider-spaced frames with truthful timestamps.
-function windowsStreamScript(region, title, intervalMs) {
+function windowsStreamScript(region, title, intervalMs, windowId, rect) {
   const isWindow = region === 'window';
   // Window streams render the window's own surface fresh each frame (its size or
   // content can change). Screen streams reuse one bitmap + CopyFromScreen, which
@@ -211,10 +230,11 @@ function windowsStreamScript(region, title, intervalMs) {
   // stream fails fast (readiness error) instead of looping on a bad target.
   const setup = isWindow
     ? `
-$hwnd = Find-TargetWindow -title '${psQuote(title)}'
+$hwnd = Find-TargetWindow -title '${psQuote(title)}' -windowId '${psQuote(windowId)}'
 Assert-Capturable $hwnd '${psQuote(title)}'`
     : `
 $bounds = if ('${psQuote(region)}' -eq 'virtual') { [System.Windows.Forms.SystemInformation]::VirtualScreen } else { [System.Windows.Forms.Screen]::PrimaryScreen.Bounds }
+${rect ? `$bounds = New-Object System.Drawing.Rectangle(($bounds.X + ${rect.x}), ($bounds.Y + ${rect.y}), ${rect.w}, ${rect.h})` : ''}
 $bmp = New-Object System.Drawing.Bitmap($bounds.Width, $bounds.Height)
 $gfx = [System.Drawing.Graphics]::FromImage($bmp)`;
   // Per-frame grab. For a window: skip the frame if it is transiently minimized
@@ -245,6 +265,7 @@ while ($true) {
 ${grabFrame}
   $elapsed = $sw.Elapsed.TotalMilliseconds
   $ms = New-Object System.IO.MemoryStream
+  ${psCropBitmap(isWindow ? rect : null, '$frame')}
   $frame.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png)
   $stdout.WriteLine("FRAME " + [int]$elapsed + " " + [Convert]::ToBase64String($ms.ToArray()))
   $ms.Dispose()
@@ -255,8 +276,8 @@ ${grabFrame}
 `;
 }
 
-function startStreamWindows({ region, title, intervalMs }, onFrame) {
-  const script = windowsStreamScript(region, title, intervalMs);
+function startStreamWindows({ region, title, intervalMs, windowId, rect }, onFrame) {
+  const script = windowsStreamScript(region, title, intervalMs, windowId, rect);
   const child = spawn(
     'powershell.exe',
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', script],
@@ -336,6 +357,7 @@ $list = foreach ($p in $procs) {
     process = $p.ProcessName
     x = $rect.Left; y = $rect.Top
     width = ($rect.Right - $rect.Left); height = ($rect.Bottom - $rect.Top)
+    id = $h.ToInt64().ToString()
     hidden = [bool]$hidden
   }
 }
@@ -354,84 +376,116 @@ $list | ConvertTo-Json -Compress
 
 // --- Linux backends --------------------------------------------------------
 
-async function grabLinux({ region, title }) {
-  const isWayland = !!process.env.WAYLAND_DISPLAY;
-
-  if (region === 'window') {
-    // Honour the window target explicitly, or fail — never silently broaden to
-    // the whole desktop. Window capture needs ffmpeg + xdotool geometry.
-    const [ffmpeg, xdotool] = await Promise.all([which('ffmpeg'), which('xdotool')]);
-    if (!ffmpeg || !xdotool) {
-      throw new TargetUnavailableError(
-        'Window capture on Linux requires both ffmpeg and xdotool on PATH.'
-      );
-    }
-    const { stdout } = await execFileAsync('xdotool', [
-      'search', '--name', title || '', 'getwindowgeometry', '--shell',
-    ]).catch(() => ({ stdout: '' }));
-    const geo = Object.fromEntries(
-      stdout.split(/\r?\n/).map((l) => l.split('=')).filter((p) => p.length === 2)
-    );
-    if (!geo.WIDTH || !geo.HEIGHT) {
-      throw new TargetUnavailableError(`Window capture target not found: "${title}"`);
-    }
-    return runCapture('ffmpeg', [
-      '-y', '-f', 'x11grab',
-      '-video_size', `${geo.WIDTH}x${geo.HEIGHT}`,
-      '-i', `${process.env.DISPLAY || ':0'}+${geo.X || 0},${geo.Y || 0}`,
-      '-frames:v', '1', '-f', 'image2', '-c:v', 'png', 'pipe:1',
-    ]);
-  }
-
-  if (isWayland && (await which('grim'))) {
-    return runCapture('grim', ['-']);
-  }
-  if (await which('scrot')) {
-    return runCapture('scrot', ['-o', '/dev/stdout']);
-  }
-  if (await which('import')) {
-    return runCapture('import', ['-window', 'root', 'png:-']);
-  }
-  if (await which('ffmpeg')) {
-    return runCapture('ffmpeg', [
-      '-y', '-f', 'x11grab', '-i', process.env.DISPLAY || ':0',
-      '-frames:v', '1', '-f', 'image2', '-c:v', 'png', 'pipe:1',
-    ]);
-  }
-  throw new Error('No Linux capture backend found (tried grim, scrot, import, ffmpeg)');
+async function linuxWindow(id) {
+  const [{ stdout: geo }, { stdout: title }, { stdout: info }] = await Promise.all([
+    execFileAsync('xdotool', ['getwindowgeometry', '--shell', String(id)]),
+    execFileAsync('xdotool', ['getwindowname', String(id)]),
+    execFileAsync('xwininfo', ['-id', String(id)]),
+  ]);
+  const fields = Object.fromEntries(geo.trim().split(/\r?\n/).map((l) => l.split('=')));
+  return { id: String(id), title: title.trim(), x: +fields.X, y: +fields.Y,
+    width: +fields.WIDTH, height: +fields.HEIGHT,
+    hidden: !/Map State:\s*IsViewable/.test(info) };
 }
 
 async function listWindowsLinux() {
-  const wmctrl = await which('wmctrl');
-  if (wmctrl) {
-    const { stdout } = await execFileAsync('wmctrl', ['-lG']).catch(() => ({ stdout: '' }));
-    return stdout
-      .split(/\r?\n/)
-      .filter(Boolean)
-      .map((line) => {
-        const parts = line.trim().split(/\s+/);
-        const [, , x, y, w, h] = parts;
-        const title = parts.slice(7).join(' ');
-        return { title, x: +x, y: +y, width: +w, height: +h };
-      });
+  if (process.env.WAYLAND_DISPLAY) return [];
+  if (!(await which('xdotool')) || !(await which('xwininfo'))) return [];
+  const { stdout } = await execFileAsync('xdotool', ['search', '--name', '']).catch(() => ({ stdout: '' }));
+  const ids = [...new Set(stdout.trim().split(/\r?\n/).filter(Boolean))];
+  const out = [];
+  for (const id of ids) {
+    try { const w = await linuxWindow(id); if (w.title) out.push(w); } catch { /* window closed during discovery */ }
   }
-  const xdotool = await which('xdotool');
-  if (xdotool) {
-    const { stdout } = await execFileAsync('xdotool', ['search', '--name', '']).catch(() => ({ stdout: '' }));
-    const ids = stdout.split(/\r?\n/).filter(Boolean);
-    const out = [];
-    for (const id of ids.slice(0, 100)) {
-      const { stdout: name } = await execFileAsync('xdotool', ['getwindowname', id]).catch(() => ({ stdout: '' }));
-      if (name.trim()) out.push({ title: name.trim(), id });
+  return out;
+}
+
+async function resolveTarget(opts) {
+  const region = opts.region || 'primary';
+  if (!['primary', 'virtual', 'window'].includes(region)) throw new TargetUnavailableError('Unknown capture region');
+  if (process.platform === 'darwin' && region === 'virtual') throw new TargetUnavailableError('macOS virtual-desktop capture is unsupported; select region:"primary" or a rect');
+  if (process.platform === 'linux' && process.env.WAYLAND_DISPLAY && region === 'primary' && !opts.rect) {
+    throw new TargetUnavailableError('Wayland cannot resolve a primary output on this backend; select region:"virtual" or an explicit rect');
+  }
+  if (region !== 'window' && (opts.windowId != null || opts.title)) throw new TargetUnavailableError('windowId/title requires region:"window"');
+  let window = null;
+  if (region === 'window') {
+    if (process.platform === 'darwin' || process.env.WAYLAND_DISPLAY) throw new TargetUnavailableError('Window capture is unsupported on this backend');
+    if (process.platform === 'linux' && (!(await which('xdotool')) || !(await which('xwininfo')))) {
+      throw new TargetUnavailableError('X11 window capture requires xdotool and xwininfo');
     }
-    return out;
+    if (opts.windowId != null && !/^(?:[1-9]\d*|0x[\da-f]+)$/i.test(String(opts.windowId))) throw new TargetUnavailableError('windowId must be a positive decimal or hexadecimal native window ID');
+    window = opts.windowId != null && process.platform === 'linux'
+      ? selectWindow([await linuxWindow(opts.windowId).catch(() => ({ id: opts.windowId, hidden: true }))], opts)
+      : selectWindow(await listWindows(), opts);
   }
-  return [];
+  let desktop = null;
+  if (!window && process.platform === 'linux' && !process.env.WAYLAND_DISPLAY && await which('xdotool')) {
+    const { stdout } = await execFileAsync('xdotool', ['getdisplaygeometry']);
+    const [width, height] = stdout.trim().split(/\s+/).map(Number);
+    desktop = { x: 0, y: 0, width, height };
+    if (region === 'primary' && await which('xrandr')) {
+      const monitors = await execFileAsync('xrandr', ['--listmonitors']).catch(() => ({ stdout: '' }));
+      const line = monitors.stdout.split(/\r?\n/).find((l) => /\S*\*\S*\s+\d+\//.test(l));
+      const m = line?.match(/(\d+)\/\d+x(\d+)\/\d+([+-]\d+)([+-]\d+)/);
+      if (m) desktop = { x: +m[3], y: +m[4], width: +m[1], height: +m[2] };
+    }
+  } else if (!window && process.platform === 'win32') {
+    const { stdout } = await execFileAsync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `Add-Type -AssemblyName System.Windows.Forms; $b = if ('${psQuote(region)}' -eq 'virtual') { [System.Windows.Forms.SystemInformation]::VirtualScreen } else { [System.Windows.Forms.Screen]::PrimaryScreen.Bounds }; @{ x=$b.X; y=$b.Y; width=$b.Width; height=$b.Height } | ConvertTo-Json -Compress`]);
+    desktop = JSON.parse(stdout.trim());
+  }
+  const rect = captureRect(opts.rect, window || desktop);
+  const bounds = window ? { x: window.x + (rect?.x || 0), y: window.y + (rect?.y || 0),
+    width: rect?.w || window.width, height: rect?.h || window.height } : desktop
+    ? { x: desktop.x + (rect?.x || 0), y: desktop.y + (rect?.y || 0), width: rect?.w || desktop.width, height: rect?.h || desktop.height } : null;
+  return { region, windowId: window?.id || null, title: window?.title || null,
+    rect, bounds, boundsAt: 'capture-start', captureMethod: region === 'window'
+      ? process.platform === 'linux' ? 'screen-rectangle' : 'window-surface'
+      : rect ? 'screen-rectangle' : 'display' };
+}
+
+async function x11Input(target, fps) {
+  const display = process.env.DISPLAY || ':0';
+  // Root bounds also validate a desktop rectangle before capture begins.
+  const { stdout } = await execFileAsync('xdotool', ['getdisplaygeometry']);
+  const [width, height] = stdout.trim().split(/\s+/).map(Number);
+  const rect = captureRect(target.rect, target.windowId ? null : { width, height });
+  const x = target.windowId ? rect?.x || 0 : target.bounds?.x || 0;
+  const y = target.windowId ? rect?.y || 0 : target.bounds?.y || 0;
+  const args = ['-f', 'x11grab', '-framerate', String(fps)];
+  if (target.windowId) args.push('-window_id', String(target.windowId));
+  const w = rect?.w || target.bounds?.width || width;
+  const h = rect?.h || target.bounds?.height || height;
+  args.push('-video_size', `${w}x${h}`, '-i', `${display}+${x},${y}`);
+  target.bounds ||= { x, y, width: w, height: h };
+  return args;
+}
+
+async function grabLinux(opts) {
+  const { region, rect, target, signal } = opts;
+  if (region === 'window') {
+    return runCapture('ffmpeg', ['-hide_banner', '-loglevel', 'error', '-probesize', '32', '-analyzeduration', '0',
+      ...await x11Input(target, 1), '-frames:v', '1', '-f', 'image2pipe', '-c:v', 'png', '-pix_fmt', 'rgb24', 'pipe:1'], { signal });
+  }
+  if (process.env.WAYLAND_DISPLAY) {
+    if (!(await which('grim'))) throw new Error('Wayland capture requires grim');
+    return runCapture('grim', [...(rect ? ['-g', `${rect.x},${rect.y} ${rect.w}x${rect.h}`] : []), '-'], { signal });
+  }
+  if (await which('import')) {
+    const crop = target.bounds || (rect ? { x: rect.x, y: rect.y, width: rect.w, height: rect.h } : null);
+    return runCapture('import', ['-window', 'root', '-depth', '8', '-define', 'png:color-type=2', '-interlace', 'none',
+      ...(crop ? ['-crop', `${crop.width}x${crop.height}+${crop.x}+${crop.y}`, '+repage'] : []), 'png:-'], { signal });
+  }
+  if (await which('ffmpeg')) {
+    return runCapture('ffmpeg', ['-probesize', '32', '-analyzeduration', '0', ...await x11Input(target, 1), '-frames:v', '1', '-f', 'image2pipe', '-c:v', 'png', '-pix_fmt', 'rgb24', 'pipe:1'], { signal });
+  }
+  if (!rect && await which('scrot')) return runCapture('scrot', ['-o', '/dev/stdout'], { signal });
+  throw new Error('No Linux capture backend found for this region (tried grim, import, ffmpeg, scrot)');
 }
 
 // --- macOS backend ---------------------------------------------------------
 
-async function grabDarwin({ region, title }) {
+async function grabDarwin({ region, title, rect, signal }) {
   if (region === 'window') {
     // The bundled screencapture path captures a display, not an arbitrary
     // window surface, so window scope cannot be honoured here. Fail loudly
@@ -440,7 +494,7 @@ async function grabDarwin({ region, title }) {
   }
   if (await which('screencapture')) {
     const tmp = `${os.tmpdir()}/marey-${process.pid}-${process.hrtime.bigint()}.png`;
-    await execFileAsync('screencapture', ['-x', '-t', 'png', tmp]);
+    await execFileAsync('screencapture', ['-x', '-t', 'png', ...(rect ? ['-R', `${rect.x},${rect.y},${rect.w},${rect.h}`] : ['-m']), tmp], { signal, timeout: 10000 });
     const { readFile, unlink } = await import('node:fs/promises');
     const buf = await readFile(tmp);
     await unlink(tmp).catch(() => {});
@@ -449,13 +503,24 @@ async function grabDarwin({ region, title }) {
   throw new Error('macOS capture requires the `screencapture` tool');
 }
 
+async function macStreamInput(target, fps) {
+  let listing = '';
+  try {
+    const result = await execFileAsync('ffmpeg', ['-hide_banner', '-f', 'avfoundation', '-list_devices', 'true', '-i', '']);
+    listing = result.stderr;
+  } catch (err) { listing = String(err.stderr || ''); }
+  const screen = listing.match(/\[(\d+)\] Capture screen 0/);
+  if (!screen) throw new Error('FFmpeg could not enumerate macOS screen 0; enable Screen Recording permission or use the native screencapture fallback without FFmpeg on PATH');
+  return ['-f', 'avfoundation', '-framerate', String(fps), '-pixel_format', 'bgr0', '-capture_cursor', '1', '-i', `${screen[1]}:none`];
+}
+
 // --- portable streaming (non-Windows) --------------------------------------
 
 // Timed loop of single captures until stopped. The FIRST capture is treated as
 // readiness: if it fails, the stream errors and exits immediately so the
 // recorder reports a real startup failure instead of an endless empty session.
 // Later transient failures are counted but do not kill the stream.
-function startStreamPortable({ region, title, intervalMs }, onFrame, deps) {
+export function startStreamPortable({ region, title, windowId, rect, target, intervalMs }, onFrame, deps) {
   const grab = deps.grabPng;
   const clock = deps.clock;
   let stopped = false;
@@ -464,6 +529,7 @@ function startStreamPortable({ region, title, intervalMs }, onFrame, deps) {
   let count = 0;
   let firstError = null;
   let transientErrors = 0;
+  const abort = new AbortController();
   const start = clock.now();
 
   let resolveClosed;
@@ -473,11 +539,13 @@ function startStreamPortable({ region, title, intervalMs }, onFrame, deps) {
   const tick = async () => {
     if (stopped) return;
     try {
-      const png = await grab({ region, title });
+      const captureTime = clock.now();
+      const png = await grab({ region, title, windowId, rect, target, signal: abort.signal });
       if (stopped) return;
       count++;
-      if (onFrame) onFrame({ png, timeMs: Math.round(clock.now() - start) }, count);
+      if (onFrame) onFrame({ png, timeMs: Math.round(captureTime - start), target, timingSource: 'capture-start' }, count);
     } catch (err) {
+      if (stopped) return;
       if (count === 0) {
         // First frame failed → fatal startup/target error.
         firstError = err;
@@ -486,13 +554,17 @@ function startStreamPortable({ region, title, intervalMs }, onFrame, deps) {
       }
       transientErrors++;
     }
-    if (!stopped) timer = clock.setTimeout(tick, intervalMs);
+    if (!stopped) {
+      const nextSlot = Math.floor((clock.now() - start) / intervalMs) + 1;
+      timer = clock.setTimeout(tick, Math.max(0, start + nextSlot * intervalMs - clock.now()));
+    }
   };
   timer = clock.setTimeout(tick, 0);
 
   return {
     stop() {
       stopped = true;
+      abort.abort();
       if (timer) clock.clearTimeout(timer);
       finish();
       return closed;
@@ -514,25 +586,31 @@ function startStreamPortable({ region, title, intervalMs }, onFrame, deps) {
 // | 'window'. Throws TargetUnavailableError when a window target cannot be
 // honoured on this backend.
 export async function grabPng(opts = {}) {
-  const region = opts.region || 'primary';
-  const title = opts.title;
+  const target = opts.target || await resolveTarget(opts);
+  const configured = { ...opts, ...target, target };
   switch (process.platform) {
-    case 'win32': return grabWindows({ region, title });
-    case 'linux': return grabLinux({ region, title });
-    case 'darwin': return grabDarwin({ region, title });
+    case 'win32': return grabWindows(configured);
+    case 'linux': return grabLinux(configured);
+    case 'darwin': return grabDarwin(configured);
     default: throw new Error(`Unsupported platform: ${process.platform}`);
   }
 }
 
 // Capture a single frame and return a decoded RGBA image: { width, height, data }.
 // Thin wrapper over grabPng for the single-shot `capture` tool.
-export async function captureFrame(opts = {}) {
-  return decodePng(await grabPng(opts));
+export async function captureImage(opts = {}) {
+  const target = await resolveTarget(opts);
+  const image = decodePng(await grabPng({ ...opts, target }));
+  if (!target.bounds) target.bounds = { x: target.rect?.x || 0, y: target.rect?.y || 0, width: image.width, height: image.height };
+  return { image, target, backend: process.platform === 'linux' && target.region === 'window' ? 'linux:ffmpeg' : await detectBackend() };
 }
+
+export async function captureFrame(opts = {}) { return (await captureImage(opts)).image; }
 
 // The default capture backend used by the session controller. Streams raw PNG
 // frames. On Windows a single PowerShell process does the whole stream (so the
-// frame rate is real); elsewhere a timed per-frame loop is used.
+// frame rate is real); X11/macOS use FFmpeg when available. Other backends
+// keep a deadline-scheduled fallback loop and report that limitation.
 //
 // startStream({ region, title, intervalMs }, onFrame) -> handle where
 //   onFrame({ png, timeMs }, count) fires per frame,
@@ -541,8 +619,22 @@ export function createDefaultBackend(clock) {
   return {
     name: 'default',
     startStream(opts, onFrame) {
-      if (process.platform === 'win32') return startStreamWindows(opts, onFrame);
-      return startStreamPortable(opts, onFrame, { grabPng, clock });
+      return deferredStream(async () => {
+        const target = await resolveTarget(opts);
+        const configured = { ...opts, ...target, target };
+        if (process.platform === 'win32') {
+          return Object.assign(startStreamWindows(configured, onFrame), { target, backend: 'windows:System.Drawing', timingSource: 'capture-clock' });
+        }
+        if (process.platform === 'linux' && !process.env.WAYLAND_DISPLAY && await which('ffmpeg') && await which('xdotool')) {
+          return startFfmpegStream(await x11Input(target, 1000 / opts.intervalMs), onFrame, { target, backend: 'linux:ffmpeg-stream' });
+        }
+        if (process.platform === 'darwin' && await which('ffmpeg')) {
+          const input = await macStreamInput(target, 1000 / opts.intervalMs);
+          return startFfmpegStream(input, onFrame, { target, backend: 'darwin:ffmpeg-stream',
+            cropFilter: target.rect ? `crop=${target.rect.w}:${target.rect.h}:${target.rect.x}:${target.rect.y}` : null });
+        }
+        return Object.assign(startStreamPortable(configured, onFrame, { grabPng, clock }), { target, backend: await detectBackend(), timingSource: 'capture-start', warnings: ['Single-frame fallback backend: brief events may be missed; install FFmpeg for continuous X11/macOS capture.'] });
+      });
     },
   };
 }
@@ -567,16 +659,20 @@ export async function captureCapabilities() {
   if (process.platform === 'win32') {
     windowCapture = true;
   } else if (process.platform === 'linux') {
-    const [ffmpeg, xdotool] = await Promise.all([which('ffmpeg'), which('xdotool')]);
-    windowCapture = !!(ffmpeg && xdotool);
+    const [ffmpeg, xdotool, xwininfo] = await Promise.all([which('ffmpeg'), which('xdotool'), which('xwininfo')]);
+    windowCapture = !process.env.WAYLAND_DISPLAY && !!(ffmpeg && xdotool && xwininfo);
   } else if (process.platform === 'darwin') {
     windowCapture = false; // display-only via screencapture
   }
   return {
     platform: process.platform,
     backend,
-    regions: windowCapture ? ['primary', 'virtual', 'window'] : ['primary', 'virtual'],
+    regions: process.platform === 'darwin' ? ['primary']
+      : process.platform === 'linux' && process.env.WAYLAND_DISPLAY ? ['virtual']
+      : windowCapture ? ['primary', 'virtual', 'window'] : ['primary', 'virtual'],
     windowCapture,
+    continuousCapture: process.platform === 'win32' || (process.platform === 'darwin' && !!(await which('ffmpeg')))
+      || (process.platform === 'linux' && !process.env.WAYLAND_DISPLAY && !!(await which('ffmpeg')) && !!(await which('xdotool'))),
   };
 }
 
@@ -589,8 +685,8 @@ export async function detectBackend() {
   }
   if (process.platform === 'linux') {
     if (process.env.WAYLAND_DISPLAY && (await which('grim'))) return 'linux:grim';
-    if (await which('scrot')) return 'linux:scrot';
     if (await which('import')) return 'linux:import';
+    if (await which('scrot')) return 'linux:scrot';
     if (await which('ffmpeg')) return 'linux:ffmpeg';
     return 'linux:none';
   }

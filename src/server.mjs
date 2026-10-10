@@ -7,9 +7,10 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { StdioServer } from './jsonrpc.mjs';
-import { record, capture, getFrame, startRecording, stopRecording, recordingStatus, observe, replay } from './recorder.mjs';
+import { record, capture, getFrame, startRecording, stopRecording, recordingStatus, observe, replay, getFrames } from './recorder.mjs';
 import { listWindows, detectBackend } from './capture.mjs';
 import { TargetUnavailableError } from './capture.mjs';
+import { recordingMetadata, evidenceSummary } from './evidence.mjs';
 
 // Single source of truth for the version: package.json. Keeps the version
 // reported over MCP in sync with the published npm package automatically.
@@ -17,7 +18,9 @@ const pkg = JSON.parse(
   readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'),
 );
 
-const PROTOCOL_VERSION = '2024-11-05';
+const PROTOCOL_VERSIONS = ['2025-11-25', '2025-06-18', '2025-03-26', '2024-11-05'];
+let protocolVersion = '2024-11-05';
+const structured = (value) => protocolVersion >= '2025-06-18' ? { structuredContent: value } : {};
 const SERVER_INFO = { name: 'marey', version: pkg.version };
 
 const TOOLS = [
@@ -33,7 +36,7 @@ const TOOLS = [
       type: 'object',
       properties: {
         seconds: { type: 'number', description: 'Recording duration in seconds (default 5).' },
-        fps: { type: 'number', description: 'Frames captured per second (default 2).' },
+        fps: { type: 'number', description: 'Target frames per second (default 15). Check achieved FPS and gaps in the result; short events can still fall between frames.' },
         region: {
           type: 'string',
           enum: ['primary', 'virtual', 'window'],
@@ -78,7 +81,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        fps: { type: 'number', description: 'Frames captured per second (default 2).' },
+        fps: { type: 'number', description: 'Target frames per second (default 15). Check achieved FPS and gaps in the result; short events can still fall between frames.' },
         region: { type: 'string', enum: ['primary', 'virtual', 'window'], description: 'Capture region (default primary).' },
         title: { type: 'string', description: 'Window-title substring to match when region is "window".' },
         delay: { type: 'number', description: 'Seconds to wait before capture begins (default 0).' },
@@ -112,7 +115,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        fps: { type: 'number', description: 'Frames captured per second (default 2).' },
+        fps: { type: 'number', description: 'Target frames per second (default 15). Check achieved FPS and gaps in the result; short events can still fall between frames.' },
         region: { type: 'string', enum: ['primary', 'virtual', 'window'], description: 'Capture region (default primary).' },
         title: { type: 'string', description: 'Window-title substring to match when region is "window".' },
         maxSeconds: { type: 'number', description: 'Safety cap: auto-finish after this many seconds if the user never clicks (default 120, max 600).' },
@@ -139,7 +142,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        fps: { type: 'number', description: 'Frames captured per second (default 2). The rolling buffer holds windowSeconds × fps frames.' },
+        fps: { type: 'number', description: 'Target frames per second (default 15). Check achieved FPS and gaps in the result; short events can still fall between frames. The rolling buffer holds windowSeconds × fps frames.' },
         windowSeconds: { type: 'number', description: 'Look-back window kept in the rolling buffer, in seconds (default 20, max 120). Each Mark saves the frames from the last this-many seconds.' },
         region: { type: 'string', enum: ['primary', 'virtual', 'window'], description: 'Capture region (default primary).' },
         title: { type: 'string', description: 'Window-title substring to match when region is "window".' },
@@ -203,15 +206,35 @@ const TOOLS = [
   },
 ];
 
+const WINDOW_ID_SCHEMA = { type: 'string', description: 'Stable native window ID from list_windows. Preferred over title; requires region:"window".' };
+const RECT_SCHEMA = { type: 'object', description: 'Capture only this rectangle, in pixels relative to the selected display/window. Applied during recording, not only to output thumbnails.',
+  properties: { x: { type: 'integer', minimum: 0 }, y: { type: 'integer', minimum: 0 }, w: { type: 'integer', minimum: 1 }, h: { type: 'integer', minimum: 1 } }, required: ['x', 'y', 'w', 'h'], additionalProperties: false };
+for (const tool of TOOLS) {
+  if (['record', 'capture', 'start_recording', 'observe', 'replay'].includes(tool.name)) {
+    Object.assign(tool.inputSchema.properties, { windowId: WINDOW_ID_SCHEMA, rect: RECT_SCHEMA });
+  }
+  if (['record', 'stop_recording', 'observe', 'replay'].includes(tool.name)) {
+    tool.outputSchema = { type: 'object', properties: { quality: { type: 'object' }, actual: { type: 'object' }, target: { type: 'object' }, warnings: { type: 'array', items: { type: 'string' } }, errors: { type: 'array', items: { type: 'string' } } }, required: ['quality', 'actual', 'target'] };
+  }
+}
+TOOLS.push({ name: 'get_frames', description: 'Inspect a chronological time range from a recording as one contact sheet. Preserves before/changed/after neighborhoods. Use to investigate a transition without calling get_frame separately for every frame. Times are acquisition milliseconds, not frame numbers. Original frames remain available with get_frame.',
+  inputSchema: { type: 'object', properties: {
+    dir: { type: 'string', description: 'Recording directory from a record/replay result.' },
+    startMs: { type: 'number', minimum: 0, description: 'Inclusive start time in milliseconds (default 0).' },
+    endMs: { type: 'number', minimum: 0, description: 'Inclusive end time in milliseconds (default last frame).' },
+    maxFrames: { type: 'integer', minimum: 2, maximum: 36, description: 'Maximum displayed frames (default 12). If fewer fit, selection retains transition context.' },
+    crop: TOOLS.find((t) => t.name === 'get_frame').inputSchema.properties.crop,
+  }, required: ['dir'] } });
+
 const server = new StdioServer();
 
 // --- lifecycle -------------------------------------------------------------
 
-server.method('initialize', async () => ({
-  protocolVersion: PROTOCOL_VERSION,
-  capabilities: { tools: {} },
-  serverInfo: SERVER_INFO,
-}));
+server.method('initialize', async (params) => {
+  protocolVersion = params?.protocolVersion == null ? '2024-11-05'
+    : PROTOCOL_VERSIONS.includes(params.protocolVersion) ? params.protocolVersion : PROTOCOL_VERSIONS[0];
+  return { protocolVersion, capabilities: { tools: {} }, serverInfo: SERVER_INFO };
+});
 
 // Notification after initialize completes; nothing to do.
 server.method('notifications/initialized', async () => {});
@@ -220,7 +243,10 @@ server.method('ping', async () => ({}));
 
 // --- tools -----------------------------------------------------------------
 
-server.method('tools/list', async () => ({ tools: TOOLS }));
+server.method('tools/list', async () => ({ tools: TOOLS.map((tool) => {
+  if (protocolVersion >= '2025-06-18') return tool;
+  const { outputSchema, ...legacy } = tool; return legacy;
+}) }));
 
 server.method('tools/call', async (params) => {
   // params itself must be a well-formed tools/call. A missing/invalid tool name
@@ -230,7 +256,10 @@ server.method('tools/call', async (params) => {
   }
   const { name, arguments: rawArgs } = params;
   // Arguments, when present, must be an object; tolerate omission.
-  const args = (rawArgs && typeof rawArgs === 'object' && !Array.isArray(rawArgs)) ? rawArgs : {};
+  if (rawArgs != null && (typeof rawArgs !== 'object' || Array.isArray(rawArgs))) {
+    throw Object.assign(new Error('Invalid tools/call: arguments must be an object'), { code: -32602 });
+  }
+  const args = rawArgs || {};
 
   const dispatchTool = () => {
     switch (name) {
@@ -250,6 +279,8 @@ server.method('tools/call', async (params) => {
         return handleListWindows();
       case 'get_frame':
         return handleGetFrame(args);
+      case 'get_frames':
+        return handleGetFrames(args);
       case 'status':
         return handleStatus();
       default:
@@ -283,13 +314,13 @@ async function handleStartRecording(args) {
   const text =
     `Recording started (${s.region}${s.title ? ` · "${s.title}"` : ''}) at ${s.fps} fps, ` +
     `detail "${s.detail}".\nTell the user to perform the interaction now, then call ` +
-    `stop_recording to get the contact sheet.\nRecording dir: ${s.dir}`;
-  return { content: [{ type: 'text', text }] };
+    `stop_recording to get the contact sheet.\nRecording dir: ${s.dir}\nResolved target: ${JSON.stringify(s.target)}`;
+  return { ...structured(s), content: [{ type: 'text', text }] };
 }
 
 async function handleStopRecording() {
   const result = await stopRecording();
-  const note = result.capped ? ' (stopped automatically at the frame cap)' : '';
+  const note = result.capped ? ` (stopped automatically: ${result.completionReason})` : '';
   return contactSheetResult(result, `Stopped recording${note}; captured`);
 }
 
@@ -360,8 +391,8 @@ function replayResult(result) {
     `full resolution (dir below + the frame number), or re-run with detail:"high"/"max".\n` +
     `\nRecording dir: ${result.dir}\n\n${sections.join('\n\n')}`;
 
-  content.push({ type: 'text', text: summary });
-  return { content };
+  content.push({ type: 'text', text: `${summary}\n\n${evidenceSummary(result)}` });
+  return { content, ...structured(recordingMetadata(result)), ...(result.state === 'failed' ? { isError: true } : {}) };
 }
 
 // Shared formatter for record / stop_recording: a contact-sheet image plus a
@@ -373,8 +404,8 @@ function contactSheetResult(result, verb) {
     .join('\n');
 
   const summary =
-    `${verb} ${result.frameCount} frames over ${result.seconds.toFixed(2)}s ` +
-    `at ${result.fps} fps (${result.region}` +
+    `${verb} ${result.frameCount} frames through ${result.seconds.toFixed(2)}s ` +
+    `(${result.region}` +
     `${result.title ? ` · "${result.title}"` : ''}).\n` +
     `Detail: ${result.detail} (${result.cols} cols @ ${result.thumbWidth}px). ` +
     `Contact sheet: ${result.contactSheet.width}×${result.contactSheet.height}px.\n` +
@@ -384,9 +415,11 @@ function contactSheetResult(result, verb) {
     `detail:"high"/"max" or region:"window".\n` +
     `\nRecording dir: ${result.dir}\n` +
     `Full-resolution frames (use get_frame with this dir + the frame number):\n${frameList}\n` +
-    `\nContact sheet: ${result.contactSheetPath}`;
+    `\nContact sheet: ${result.contactSheetPath}\n\n${evidenceSummary(result)}`;
 
   return {
+    ...structured(recordingMetadata(result)),
+    ...(result.state === 'failed' ? { isError: true } : {}),
     content: [
       imageContent(result.contactSheet.buffer),
       { type: 'text', text: summary },
@@ -399,9 +432,10 @@ async function handleCapture(args) {
   const summary =
     `Captured ${result.width}×${result.height}px (${result.region}` +
     `${result.title ? ` · "${result.title}"` : ''}).\n` +
-    `Saved: ${result.path}`;
+    `Saved: ${result.path}\nActual target: ${JSON.stringify(result.target)}`;
 
   return {
+    ...structured({ target: result.target, backend: result.backend, width: result.width, height: result.height, path: result.path }),
     content: [
       imageContent(result.image.buffer),
       { type: 'text', text: summary },
@@ -422,6 +456,15 @@ async function handleGetFrame(args) {
       { type: 'text', text: summary },
     ],
   };
+}
+
+async function handleGetFrames(args) {
+  const result = await getFrames(args);
+  const { image, ...metadata } = result;
+  return { ...structured(metadata), content: [imageContent(image.buffer), { type: 'text', text:
+    `Time range ${args.startMs ?? 0}–${args.endMs ?? 'last'}ms: showing ${result.frames.length} of ${result.availableFrames} recorded frames.\n` +
+    result.frames.map((f) => `#${String(f.index).padStart(3, '0')} @ ${f.timeMs.toFixed(1)}ms`).join('\n') +
+    `\nRecording dir: ${result.dir}\n${[...result.warnings, ...result.captureWarnings, ...result.captureErrors].join('\n')}\nCapture quality: ${JSON.stringify(result.quality)}; range quality: ${JSON.stringify(result.rangeQuality)}. Gaps contain no visual evidence; use get_frame for originals.` }] };
 }
 
 async function handleStatus() {
@@ -445,12 +488,13 @@ async function handleListWindows() {
               ? ` [${w.width}×${w.height} @ ${w.x ?? '?'},${w.y ?? '?'}]`
               : '';
           const proc = w.process ? ` (${w.process})` : '';
-          return `• ${w.title}${proc}${geo}`;
+          return `• ID ${w.id ?? 'unavailable'}: ${w.title}${proc}${geo}${w.hidden ? ' [hidden/minimized — cannot capture]' : ''}`;
         })
         .join('\n')
     : '(no windows reported by this platform/backend)';
 
   return {
+    ...structured({ backend, windows }),
     content: [
       {
         type: 'text',
@@ -485,5 +529,5 @@ function toolError(toolName, err) {
 
 // --- boot ------------------------------------------------------------------
 
-server.log(`[marey] MCP server ready (protocol ${PROTOCOL_VERSION}). Awaiting stdio.`);
+server.log(`[marey] MCP server ready (protocol negotiation enabled). Awaiting stdio.`);
 server.listen();
