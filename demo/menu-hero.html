@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Clipped menu labels — annotated demonstration</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; }
+    body { width: 1488px; height: 760px; background: #f4f7fa; color: #18293e; font-family: Arial, sans-serif; }
+    header { height: 112px; padding: 22px 32px; background: #18293e; color: white; }
+    .eyebrow { color: #a9c8dc; font-size: 14px; font-weight: 700; letter-spacing: 1.6px; margin-bottom: 8px; }
+    h1 { font-size: 34px; line-height: 1.2; margin: 0; letter-spacing: -.5px; }
+    .phases { height: 80px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; padding: 0 16px; }
+    .phase { padding: 14px 18px; }
+    .phase strong { font-size: 25px; line-height: 1.3; }
+    .phase p { font-size: 17px; color: #53677a; margin: 5px 0 0; }
+    .open strong { color: #176a56; }
+    .bug strong { color: #b32932; }
+    .sheet { position: relative; height: 474px; }
+    .sheet img { display: block; width: 1488px; height: 474px; }
+    .clipped { position: absolute; left: {{LEFT}}px; top: {{TOP}}px; width: {{WIDTH}}px; height: {{HEIGHT}}px; border: 3px dashed #c42c37; border-radius: 10px; }
+    .callout { position: absolute; right: calc(1488px - {{LEFT}}px + 12px); top: calc({{TOP}}px + 63px); background: #fff4f4; color: #a61e29; padding: 8px 12px; border: 1px solid #efc7cb; border-radius: 6px; font-size: 22px; font-weight: 700; }
+    footer { height: 94px; display: grid; grid-template-columns: 1fr 1fr; align-items: center; gap: 32px; padding: 14px 32px; }
+    footer strong { display: block; font-size: 14px; letter-spacing: 1px; margin-bottom: 5px; }
+    footer p { font-size: 24px; line-height: 1.2; margin: 0; }
+    .expected strong { color: #176a56; }
+    .observed strong { color: #b32932; }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="eyebrow">MAREY · UI DEBUGGING DEMO</div>
+    <h1>Click opens the menu. Then its labels get cut off.</h1>
+  </header>
+  <div class="phases">
+    <div class="phase"><strong>1. Before the click</strong><p>Menu closed — normal initial state.</p></div>
+    <div class="phase open"><strong>2. Menu opens correctly</strong><p>Every action label is fully readable.</p></div>
+    <div class="phase bug"><strong>3. BUG: text gets cut off</strong><p>A layout update makes the menu too narrow.</p></div>
+  </div>
+  <div class="sheet">
+    <img src="data:image/png;base64,{{SHEET}}" alt="Marey contact sheet: menu closed, fully readable, then too narrow with clipped labels">
+    <div class="clipped"></div>
+    <div class="callout">Labels cut off →</div>
+  </div>
+  <footer>
+    <div class="expected"><strong>EXPECTED</strong><p>Every action label stays fully readable.</p></div>
+    <div class="observed"><strong>OBSERVED</strong><p>The menu becomes too narrow to read.</p></div>
+  </footer>
+</body>
+</html>

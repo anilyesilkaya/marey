@@ -16,19 +16,25 @@ That's the whole install. **Zero runtime dependencies**, nothing to clone.
 
 ## See it work
 
-> **You:** "The control point sometimes jumps when I drag it in the easing editor. Can you figure out what's happening?"
+> **You:** "When I click More, the project menu opens but most of its text gets cut off. Can you find out why?"
 >
-> **Agent:** "Let me record the interaction with Marey." *(records while you reproduce the drag)*
+> **Agent:** "Let me record the interaction with Marey." *(records while you reproduce the click)*
 
-Marey returns one image — the drag, decomposed into time:
+**The bug:** clicking **More** opens a readable menu, but a layout update makes it so narrow that most of each action label is cut off.
 
-![Marey contact sheet: a control point jumping during a drag](demo/contactsheet-hero.png)
+The contact sheet preserves the failure in three frames: **before the click → readable menu → clipped text**. The red outline highlights the broken menu width.
 
-> **Agent:** "The cursor moves continuously, but watch the inspector's **X** value. Through **#006 (1.25 s)** the control point tracks the cursor exactly — both read `x 331`. At **#007 (1.50 s)** a snap guide appears at the `400` gridline while the point is still tracking at `343`. One frame later, at **#008 (1.75 s)**, the point snaps to `X 400 px` while the cursor has only reached `355` — a ~45 px discontinuity. From there the cursor keeps gliding and by **#013 (3.00 s)** has *overtaken* the point (`415`), yet the point stays pinned at `400`. It isn't lagging — it's stuck to the line. Snapping is engaging too early; the snap threshold looks like it's being scaled by the 200% zoom, so it fires in canvas space instead of screen space. I'd check the snap-distance calculation."
+![Annotated UI bug: clicking More opens a readable project menu at 0.36 seconds; by 0.48 seconds it has shrunk to the button's width and cut off most of each action label. A red outline highlights the clipping.](demo/contactsheet-hero.png)
 
-A single screenshot would show *a* point and *a* cursor — and miss the jump entirely. The sequence makes the exact failing transition obvious, and the agent reads its diagnosis straight off the frames.
+An illustrative agent response:
 
-<sub>This is a real Marey contact sheet. Reproduce it with [`node demo/make-contactsheet.mjs`](demo/make-contactsheet.mjs), which renders the [bundled fixture](demo/jump-bug.html) and composes the frames with Marey's own contact-sheet code.</sub>
+> **Agent:** "At **0.36 s**, I can read all three actions. By **0.48 s**, the menu has shrunk to roughly the More button's width and the labels are clipped. It stays open throughout. I'd inspect the post-open sizing code: it may be using the trigger's width instead of the menu's content width."
+
+The sequence shows the menu opens at a readable width, then narrows while it remains open. This directs the agent to the post-open layout measurement; source inspection confirms the cause.
+
+<sub>Staged demonstration: a [browser fixture](demo/menu-clipping.html) rendered at fixed timestamps and composed with Marey's own contact-sheet code. The headings, outline, and callout are explanatory annotations added for the README; the [full contact sheet](demo/contactsheet.png) contains the raw frames. The fixture reproduces a sizing pass that incorrectly uses the trigger's width for the menu. Regenerate both images with [`node demo/make-contactsheet.mjs`](demo/make-contactsheet.mjs). Requires Chrome, Chromium, or Edge; set `CHROME_BIN` if it isn't found automatically.</sub>
+
+For containers without browser sandbox support, use `node demo/make-contactsheet.mjs --no-sandbox`.
 
 ---
 
